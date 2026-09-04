@@ -36,16 +36,25 @@ const rowToMessage = (row) => ({
 
 export default function App() {
   const [session, setSession] = useState(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
   const [profile, setProfile] = useState(null);
   const [authEmail, setAuthEmail] = useState("");
   const [authSent, setAuthSent] = useState(false);
   const [authError, setAuthError] = useState("");
   const [resendCooldown, setResendCooldown] = useState(0);
 
-  // auth bootstrap
+  // auth bootstrap — wait for the initial check to actually finish before
+  // deciding whether to show the login screen, so a refresh never flashes
+  // to "logged out" while getSession() is still resolving from localStorage.
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setSessionChecked(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
+      setSession(s);
+      setSessionChecked(true);
+    });
     return () => sub.subscription.unsubscribe();
   }, []);
 
@@ -80,6 +89,8 @@ export default function App() {
     const t = setInterval(() => setResendCooldown((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(t);
   }, [resendCooldown]);
+
+  if (!sessionChecked) return <CenteredNote text="Loading…" />;
 
   if (!session) {
     return (
