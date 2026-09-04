@@ -1,13 +1,26 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { Send, Video, Mic, Check, CheckCheck, Camera, Square, X } from "lucide-react";
+import {
+  Send,
+  Paperclip,
+  Mic,
+  Check,
+  CheckCheck,
+  Camera,
+  Square,
+  X,
+  Menu,
+  Pencil,
+  Trash2,
+} from "lucide-react";
 import { supabase } from "./supabaseClient";
 
 /* ------------------------------------------------------------------ */
-/*  DATA MODEL (mirrors supabase/schema.sql)                          */
+/*  DATA MODEL (mirrors supabase/schema.sql + migration-2)            */
 /*                                                                     */
 /*  User    { id, nickname, avatarUrl }             -> "profiles"     */
 /*  Message { id, text, senderName, timestamp,                        */
-/*            videoUrl?, audioUrl?, read, reactions[] } -> "messages" */
+/*            imageUrl?, videoUrl?, audioUrl?,                        */
+/*            read, edited, reactions[] } -> "messages"               */
 /* ------------------------------------------------------------------ */
 
 const ROSE_GOLD = "#B76E79";
@@ -22,15 +35,29 @@ const REACTIONS = ["💖", "✨", "😭"];
 const fmtTime = (iso) =>
   new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
+const dayLabel = (iso) => {
+  const d = new Date(iso);
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+  const sameDay = (a, b) =>
+    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  if (sameDay(d, today)) return "Today";
+  if (sameDay(d, yesterday)) return "Yesterday";
+  return d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+};
+
 const rowToMessage = (row) => ({
   id: row.id,
   text: row.text || "",
   senderName: row.sender_name,
   senderId: row.sender_id,
   timestamp: row.created_at,
+  imageUrl: row.image_url || undefined,
   videoUrl: row.video_url || undefined,
   audioUrl: row.audio_url || undefined,
   read: row.read,
+  edited: !!row.edited,
   reactions: row.reactions || [],
 });
 
@@ -427,20 +454,40 @@ function CenteredNote({ text }) {
   );
 }
 
+
+const chatStyles = `
+  @import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&display=swap');
+  .pc-scroll::-webkit-scrollbar { width: 6px; }
+  .pc-scroll::-webkit-scrollbar-thumb { background: ${HEADER_PINK}; border-radius: 8px; }
+  .pc-bubble-in { animation: pcFadeUp .25s ease; }
+  @keyframes pcFadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes pcBlink { 0%,80%,100% { opacity: .25; } 40% { opacity: 1; } }
+  .pc-dot { animation: pcBlink 1.2s infinite; }
+  .pc-icon-btn { transition: transform .15s ease, background .15s ease; }
+  .pc-icon-btn:hover { transform: scale(1.08); }
+  .pc-icon-btn:active { transform: scale(0.94); }
+  .pc-drawer-backdrop { animation: pcFadeIn .2s ease; }
+  @keyframes pcFadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .pc-drawer { transition: transform .28s cubic-bezier(.32,.72,0,1); }
+`;
+
 function ChatApp({ session, profile, setProfile }) {
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
   const [friendTyping, setFriendTyping] = useState(false);
-  const [openReactionFor, setOpenReactionFor] = useState(null);
+  const [openMenuFor, setOpenMenuFor] = useState(null);
   const [recording, setRecording] = useState(false);
   const [toast, setToast] = useState("");
   const [friendProfile, setFriendProfile] = useState(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [editingMessage, setEditingMessage] = useState(null); // { id, text } | null
 
   const scrollRef = useRef(null);
-  const videoInputRef = useRef(null);
+  const fileInputRef = useRef(null);
   const avatarInputRef = useRef(null);
   const typingChannelRef = useRef(null);
   const typingStopTimer = useRef(null);
+  const composerRef = useRef(null);
 
   const myId = session.user.id;
 
@@ -471,7 +518,7 @@ function ChatApp({ session, profile, setProfile }) {
       .then(({ data }) => data && data[0] && setFriendProfile(data[0]));
   }, [myId]);
 
-  // realtime: messages INSERT / UPDATE
+  // realtime: messages INSERT / UPDATE / DELETE
   useEffect(() => {
     const channel = supabase
       .channel("messages-changes")
@@ -489,6 +536,15 @@ function ChatApp({ session, profile, setProfile }) {
           setMessages((prev) =>
             prev.map((m) => (m.id === payload.new.id ? rowToMessage(payload.new) : m))
           );
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "messages" },
+        (payload) => {
+          // Stealth unsend: the row is gone from the DB, so it just
+          // vanishes from the UI — no "this message was deleted" trace.
+          setMessages((prev) => prev.filter((m) => m.id !== payload.old.id));
         }
       )
       .subscribe();
@@ -535,37 +591,99 @@ function ChatApp({ session, profile, setProfile }) {
   }, [messages, myId]);
 
   const insertMessage = async (fields = {}) => {
+    const textToSend = draft.trim();
     const { error } = await supabase.from("messages").insert({
-      text: draft.trim(),
+      text: textToSend,
       sender_id: myId,
       sender_name: profile.nickname,
       read: false,
       reactions: [],
       ...fields,
     });
-    if (error) showToast("Message failed to send");
+    if (error) {
+      // Real fix: keep the typed text in the composer on failure instead
+      // of silently clearing it — nothing gets lost on a flaky connection.
+      showToast("Message failed to send — try again");
+      return;
+    }
     setDraft("");
+  };
+
+  const saveEdit = async () => {
+    const newText = draft.trim();
+    if (!newText || !editingMessage) return;
+    const { error } = await supabase
+      .from("messages")
+      .update({ text: newText, edited: true })
+      .eq("id", editingMessage.id);
+    if (error) {
+      showToast("Couldn't save your edit — try again");
+      return;
+    }
+    setDraft("");
+    setEditingMessage(null);
+  };
+
+  const handleComposerSubmit = () => {
+    if (!draft.trim()) return;
+    if (editingMessage) saveEdit();
+    else insertMessage();
   };
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      insertMessage();
+      handleComposerSubmit();
     }
+    if (e.key === "Escape" && editingMessage) cancelEdit();
   };
 
-  const handleVideoPick = async (e) => {
+  const startEdit = (message) => {
+    setEditingMessage({ id: message.id, text: message.text });
+    setDraft(message.text);
+    setOpenMenuFor(null);
+    composerRef.current?.focus();
+  };
+
+  const cancelEdit = () => {
+    setEditingMessage(null);
+    setDraft("");
+  };
+
+  const unsendMessage = async (message) => {
+    setOpenMenuFor(null);
+    // Optimistic local removal — realtime DELETE will confirm it, but this
+    // makes it feel instant on the sender's own screen.
+    setMessages((prev) => prev.filter((m) => m.id !== message.id));
+    const { error } = await supabase.from("messages").delete().eq("id", message.id);
+    if (error) showToast("Couldn't unsend — try again");
+  };
+
+  // Generic attachment picker — routes to the right column by MIME type,
+  // so one button covers photos, videos, and pre-recorded audio files.
+  const handleFilePick = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (!file.type.startsWith("video/")) {
-      showToast("Please choose an MP4 video file");
+    let column = null;
+    if (file.type.startsWith("image/")) column = "image_url";
+    else if (file.type.startsWith("video/")) column = "video_url";
+    else if (file.type.startsWith("audio/")) column = "audio_url";
+    else {
+      showToast("That file type isn't supported yet");
+      e.target.value = "";
       return;
     }
     const path = `${myId}/${Date.now()}-${file.name}`;
-    const { error: upErr } = await supabase.storage.from("chat-media").upload(path, file);
-    if (upErr) return showToast("Video upload failed");
+    const { error: upErr } = await supabase.storage.from("chat-media").upload(path, file, {
+      contentType: file.type,
+    });
+    if (upErr) {
+      showToast("Upload failed");
+      e.target.value = "";
+      return;
+    }
     const { data } = supabase.storage.from("chat-media").getPublicUrl(path);
-    await insertMessage({ video_url: data.publicUrl });
+    await insertMessage({ [column]: data.publicUrl });
     e.target.value = "";
   };
 
@@ -573,20 +691,12 @@ function ChatApp({ session, profile, setProfile }) {
   const audioChunks = useRef([]);
   const recordingMimeRef = useRef("audio/webm");
 
-  // Pick whichever audio format this browser can actually record.
-  // iOS Safari doesn't support webm at all — it records mp4/aac instead —
-  // so hardcoding "audio/webm" breaks playback specifically on iPhone.
   const pickSupportedAudioMime = () => {
-    const candidates = [
-      "audio/mp4",
-      "audio/webm;codecs=opus",
-      "audio/webm",
-      "audio/ogg",
-    ];
+    const candidates = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm", "audio/ogg"];
     for (const type of candidates) {
       if (window.MediaRecorder?.isTypeSupported?.(type)) return type;
     }
-    return ""; // let the browser pick its own default as a last resort
+    return "";
   };
 
   const extensionFor = (mime) => {
@@ -603,8 +713,6 @@ function ChatApp({ session, profile, setProfile }) {
         const mime = pickSupportedAudioMime();
         recordingMimeRef.current = mime || "audio/webm";
         const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-        // MediaRecorder.mimeType reflects what the browser actually settled
-        // on, which can differ slightly from what we requested — trust it.
         recordingMimeRef.current = recorder.mimeType || recordingMimeRef.current;
         audioChunks.current = [];
         recorder.ondataavailable = (e) => audioChunks.current.push(e.data);
@@ -657,60 +765,314 @@ function ChatApp({ session, profile, setProfile }) {
       ? message.reactions.filter((r) => r !== emoji)
       : [...message.reactions, emoji];
     await supabase.from("messages").update({ reactions: next }).eq("id", message.id);
-    setOpenReactionFor(null);
+    setOpenMenuFor(null);
   };
+
+  // Group messages under day separators ("Today", "Yesterday", ...)
+  const groupedMessages = [];
+  let lastDay = null;
+  for (const m of messages) {
+    const label = dayLabel(m.timestamp);
+    if (label !== lastDay) {
+      groupedMessages.push({ type: "separator", label, key: `sep-${m.id}` });
+      lastDay = label;
+    }
+    groupedMessages.push({ type: "message", message: m, key: m.id });
+  }
 
   return (
     <div
       style={{
-        fontFamily: "'Quicksand','Poppins',sans-serif",
-        background: BLUSH_BG,
-        minHeight: "600px",
+        position: "fixed",
+        inset: 0,
         display: "flex",
-        borderRadius: 20,
+        flexDirection: "column",
+        background: BLUSH_BG,
+        fontFamily: "'Quicksand','Poppins',sans-serif",
         overflow: "hidden",
-        boxShadow: "0 10px 40px rgba(183,110,121,0.18)",
-        maxWidth: 920,
-        margin: "0 auto",
-        border: `1px solid ${HEADER_PINK}`,
-        position: "relative",
       }}
     >
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&display=swap');
-        .pc-scroll::-webkit-scrollbar { width: 6px; }
-        .pc-scroll::-webkit-scrollbar-thumb { background: ${HEADER_PINK}; border-radius: 8px; }
-        .pc-bubble-in { animation: pcFadeUp .25s ease; }
-        @keyframes pcFadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes pcBlink { 0%,80%,100% { opacity: .25; } 40% { opacity: 1; } }
-        .pc-dot { animation: pcBlink 1.2s infinite; }
-        .pc-icon-btn { transition: transform .15s ease, background .15s ease; }
-        .pc-icon-btn:hover { transform: scale(1.08); }
-        .pc-icon-btn:active { transform: scale(0.94); }
-      `}</style>
+      <style>{chatStyles}</style>
 
-      <aside
+      {/* ---------------- HEADER (safe-area aware) ---------------- */}
+      <div
         style={{
-          width: 220,
-          background: "linear-gradient(180deg, #FFE4EC 0%, #FFF0F5 100%)",
-          borderRight: `1px solid ${HEADER_PINK}`,
-          padding: "28px 18px",
+          background: HEADER_PINK,
+          padding: "12px 16px",
+          paddingTop: "calc(12px + env(safe-area-inset-top, 0px))",
+          paddingLeft: "calc(16px + env(safe-area-inset-left, 0px))",
+          paddingRight: "calc(16px + env(safe-area-inset-right, 0px))",
           display: "flex",
-          flexDirection: "column",
-          gap: 28,
+          alignItems: "center",
+          gap: 12,
+          borderBottom: `1px solid ${ROSE_GOLD}33`,
+          flexShrink: 0,
         }}
       >
-        <div
+        <button
+          onClick={() => setDrawerOpen(true)}
+          aria-label="Open profile menu"
+          className="pc-icon-btn"
           style={{
-            fontFamily: "'Cormorant Garamond',serif",
-            fontStyle: "italic",
-            fontSize: 24,
-            fontWeight: 600,
-            color: ROSE_GOLD,
-            textAlign: "center",
+            width: 40,
+            height: 40,
+            borderRadius: "50%",
+            border: "none",
+            background: "rgba(255,255,255,0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            flexShrink: 0,
           }}
         >
-          our little chat
+          <Menu size={19} color="#6B2F44" />
+        </button>
+
+        <Avatar url={friendProfile?.avatar_url} name={friendProfile?.nickname || "?"} size={38} ring />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, color: "#6B2F44", fontSize: 15, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {friendProfile?.nickname || "Waiting for your friend…"}
+          </div>
+          <div style={{ fontSize: 11, color: "#8A4A5D" }}>{friendTyping ? "typing…" : "online"}</div>
+        </div>
+      </div>
+
+      {/* ---------------- MESSAGES ---------------- */}
+      <div
+        ref={scrollRef}
+        className="pc-scroll"
+        style={{
+          flex: 1,
+          overflowY: "auto",
+          padding: "16px",
+          paddingLeft: "calc(16px + env(safe-area-inset-left, 0px))",
+          paddingRight: "calc(16px + env(safe-area-inset-right, 0px))",
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+        }}
+      >
+        {groupedMessages.map((item) =>
+          item.type === "separator" ? (
+            <div
+              key={item.key}
+              style={{
+                textAlign: "center",
+                fontSize: 11,
+                color: TEXT_SOFT,
+                margin: "10px 0 4px",
+                fontWeight: 600,
+                letterSpacing: 0.3,
+              }}
+            >
+              {item.label}
+            </div>
+          ) : (
+            <MessageBubble
+              key={item.key}
+              message={item.message}
+              mine={item.message.senderId === myId}
+              isOpen={openMenuFor === item.message.id}
+              onToggleMenu={() =>
+                setOpenMenuFor(openMenuFor === item.message.id ? null : item.message.id)
+              }
+              onReact={(emoji) => addReaction(item.message, emoji)}
+              onEdit={() => startEdit(item.message)}
+              onUnsend={() => unsendMessage(item.message)}
+            />
+          )
+        )}
+
+        {friendTyping && (
+          <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
+            <Avatar url={friendProfile?.avatar_url} name={friendProfile?.nickname || "?"} size={24} />
+            <div
+              className="pc-bubble-in"
+              style={{
+                background: BUBBLE_WHITE,
+                borderRadius: "18px 18px 18px 4px",
+                padding: "12px 16px",
+                display: "flex",
+                gap: 4,
+                boxShadow: "0 2px 10px rgba(183,110,121,0.12)",
+              }}
+            >
+              {[0, 1, 2].map((i) => (
+                <span
+                  key={i}
+                  className="pc-dot"
+                  style={{
+                    width: 6,
+                    height: 6,
+                    borderRadius: "50%",
+                    background: ROSE_GOLD,
+                    display: "inline-block",
+                    animationDelay: `${i * 0.15}s`,
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ---------------- COMPOSER (safe-area aware) ---------------- */}
+      <div
+        style={{
+          background: "#FFE9F0",
+          borderTop: `1px solid ${HEADER_PINK}`,
+          flexShrink: 0,
+          paddingBottom: "env(safe-area-inset-bottom, 0px)",
+        }}
+      >
+        {editingMessage && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "8px 16px 0",
+              fontSize: 12,
+              color: ROSE_GOLD,
+            }}
+          >
+            <Pencil size={12} />
+            <span style={{ flex: 1 }}>Editing message</span>
+            <button
+              onClick={cancelEdit}
+              style={{ border: "none", background: "transparent", color: TEXT_SOFT, cursor: "pointer" }}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
+        <div
+          style={{
+            padding: "10px 16px",
+            paddingLeft: "calc(16px + env(safe-area-inset-left, 0px))",
+            paddingRight: "calc(16px + env(safe-area-inset-right, 0px))",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*,video/*,audio/*"
+            style={{ display: "none" }}
+            onChange={handleFilePick}
+          />
+          <IconButton label="Attach photo, video, or audio" onClick={() => fileInputRef.current?.click()}>
+            <Paperclip size={19} color={ROSE_GOLD} />
+          </IconButton>
+          <IconButton
+            label={recording ? "Stop recording" : "Record voice note"}
+            onClick={toggleRecording}
+            active={recording}
+          >
+            {recording ? <Square size={17} color="#fff" fill="#fff" /> : <Mic size={19} color={ROSE_GOLD} />}
+          </IconButton>
+          <input
+            ref={composerRef}
+            value={draft}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              broadcastTyping();
+            }}
+            onKeyDown={handleKeyDown}
+            placeholder={editingMessage ? "Edit your message…" : "Say something sweet…"}
+            style={{
+              flex: 1,
+              minWidth: 0,
+              border: `1px solid ${HEADER_PINK}`,
+              borderRadius: 999,
+              padding: "11px 18px",
+              fontSize: 16,
+              outline: "none",
+              background: "#fff",
+              color: TEXT_DEEP,
+              fontFamily: "inherit",
+            }}
+          />
+          <button
+            onClick={handleComposerSubmit}
+            className="pc-icon-btn"
+            aria-label={editingMessage ? "Save edit" : "Send message"}
+            style={{
+              width: 40,
+              height: 40,
+              borderRadius: "50%",
+              border: "none",
+              background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              flexShrink: 0,
+            }}
+          >
+            {editingMessage ? <Check size={17} color="#fff" /> : <Send size={17} color="#fff" />}
+          </button>
+        </div>
+      </div>
+
+      {/* ---------------- PROFILE DRAWER ---------------- */}
+      {drawerOpen && (
+        <div
+          className="pc-drawer-backdrop"
+          onClick={() => setDrawerOpen(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(107,74,87,0.35)",
+            zIndex: 20,
+          }}
+        />
+      )}
+      <div
+        className="pc-drawer"
+        style={{
+          position: "fixed",
+          top: 0,
+          bottom: 0,
+          left: 0,
+          width: "78%",
+          maxWidth: 300,
+          background: "linear-gradient(180deg, #FFE4EC 0%, #FFF0F5 100%)",
+          zIndex: 21,
+          transform: drawerOpen ? "translateX(0)" : "translateX(-105%)",
+          boxShadow: drawerOpen ? "8px 0 30px rgba(183,110,121,0.25)" : "none",
+          padding: "24px 18px",
+          paddingTop: "calc(24px + env(safe-area-inset-top, 0px))",
+          paddingBottom: "calc(24px + env(safe-area-inset-bottom, 0px))",
+          paddingLeft: "calc(18px + env(safe-area-inset-left, 0px))",
+          display: "flex",
+          flexDirection: "column",
+          gap: 26,
+          overflowY: "auto",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div
+            style={{
+              fontFamily: "'Cormorant Garamond',serif",
+              fontStyle: "italic",
+              fontSize: 22,
+              fontWeight: 600,
+              color: ROSE_GOLD,
+            }}
+          >
+            our little chat
+          </div>
+          <button
+            onClick={() => setDrawerOpen(false)}
+            aria-label="Close menu"
+            style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_SOFT }}
+          >
+            <X size={18} />
+          </button>
         </div>
 
         <ProfileEditor
@@ -732,180 +1094,27 @@ function ChatApp({ session, profile, setProfile }) {
 
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
           <div style={{ fontSize: 11, color: TEXT_SOFT }}>Friend</div>
-          <Avatar
-            url={friendProfile?.avatar_url}
-            name={friendProfile?.nickname || "?"}
-            size={64}
-            ring
-          />
+          <Avatar url={friendProfile?.avatar_url} name={friendProfile?.nickname || "?"} size={64} ring />
           <div style={{ fontSize: 14, fontWeight: 600, color: TEXT_DEEP }}>
             {friendProfile?.nickname || "waiting to join…"}
           </div>
         </div>
 
-        <div style={{ marginTop: "auto", textAlign: "center", fontSize: 12, color: TEXT_SOFT }}>
+        <div style={{ marginTop: "auto", textAlign: "center" }}>
           <button
             onClick={() => supabase.auth.signOut()}
-            style={{ border: "none", background: "none", color: TEXT_SOFT, cursor: "pointer" }}
+            style={{ border: "none", background: "none", color: TEXT_SOFT, cursor: "pointer", fontSize: 13 }}
           >
             Sign out
           </button>
         </div>
-      </aside>
-
-      <main style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-        <div
-          style={{
-            background: HEADER_PINK,
-            padding: "16px 22px",
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-            borderBottom: `1px solid ${ROSE_GOLD}33`,
-          }}
-        >
-          <Avatar url={friendProfile?.avatar_url} name={friendProfile?.nickname || "?"} size={40} ring />
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontWeight: 700, color: "#6B2F44", fontSize: 16 }}>
-              {friendProfile?.nickname || "Waiting for your friend…"}
-            </div>
-            <div style={{ fontSize: 12, color: "#8A4A5D" }}>
-              {friendTyping ? "typing…" : "online"}
-            </div>
-          </div>
-        </div>
-
-        <div
-          ref={scrollRef}
-          className="pc-scroll"
-          style={{
-            flex: 1,
-            overflowY: "auto",
-            padding: "20px 22px",
-            display: "flex",
-            flexDirection: "column",
-            gap: 10,
-            background: BLUSH_BG,
-          }}
-        >
-          {messages.map((m) => (
-            <MessageBubble
-              key={m.id}
-              message={m}
-              mine={m.senderId === myId}
-              isOpen={openReactionFor === m.id}
-              onToggleReactions={() => setOpenReactionFor(openReactionFor === m.id ? null : m.id)}
-              onReact={(emoji) => addReaction(m, emoji)}
-            />
-          ))}
-
-          {friendTyping && (
-            <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
-              <Avatar url={friendProfile?.avatar_url} name={friendProfile?.nickname || "?"} size={26} />
-              <div
-                className="pc-bubble-in"
-                style={{
-                  background: BUBBLE_WHITE,
-                  borderRadius: "18px 18px 18px 4px",
-                  padding: "12px 16px",
-                  display: "flex",
-                  gap: 4,
-                  boxShadow: "0 2px 10px rgba(183,110,121,0.12)",
-                }}
-              >
-                {[0, 1, 2].map((i) => (
-                  <span
-                    key={i}
-                    className="pc-dot"
-                    style={{
-                      width: 6,
-                      height: 6,
-                      borderRadius: "50%",
-                      background: ROSE_GOLD,
-                      display: "inline-block",
-                      animationDelay: `${i * 0.15}s`,
-                    }}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div
-          style={{
-            padding: "14px 18px",
-            background: "#FFE9F0",
-            borderTop: `1px solid ${HEADER_PINK}`,
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-          }}
-        >
-          <input
-            ref={videoInputRef}
-            type="file"
-            accept="video/mp4,video/*"
-            style={{ display: "none" }}
-            onChange={handleVideoPick}
-          />
-          <IconButton label="Upload video" onClick={() => videoInputRef.current?.click()}>
-            <Video size={19} color={ROSE_GOLD} />
-          </IconButton>
-          <IconButton
-            label={recording ? "Stop recording" : "Record voice note"}
-            onClick={toggleRecording}
-            active={recording}
-          >
-            {recording ? <Square size={17} color="#fff" fill="#fff" /> : <Mic size={19} color={ROSE_GOLD} />}
-          </IconButton>
-          <input
-            value={draft}
-            onChange={(e) => {
-              setDraft(e.target.value);
-              broadcastTyping();
-            }}
-            onKeyDown={handleKeyDown}
-            placeholder="Say something sweet…"
-            style={{
-              flex: 1,
-              border: `1px solid ${HEADER_PINK}`,
-              borderRadius: 999,
-              padding: "11px 18px",
-              fontSize: 14,
-              outline: "none",
-              background: "#fff",
-              color: TEXT_DEEP,
-              fontFamily: "inherit",
-            }}
-          />
-          <button
-            onClick={() => insertMessage()}
-            className="pc-icon-btn"
-            aria-label="Send message"
-            style={{
-              width: 40,
-              height: 40,
-              borderRadius: "50%",
-              border: "none",
-              background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              cursor: "pointer",
-              flexShrink: 0,
-            }}
-          >
-            <Send size={17} color="#fff" />
-          </button>
-        </div>
-      </main>
+      </div>
 
       {toast && (
         <div
           style={{
-            position: "absolute",
-            bottom: 24,
+            position: "fixed",
+            bottom: "calc(90px + env(safe-area-inset-bottom, 0px))",
             left: "50%",
             transform: "translateX(-50%)",
             background: "#fff",
@@ -915,6 +1124,9 @@ function ChatApp({ session, profile, setProfile }) {
             fontSize: 13,
             boxShadow: "0 4px 16px rgba(183,110,121,0.25)",
             border: `1px solid ${HEADER_PINK}`,
+            zIndex: 30,
+            maxWidth: "80%",
+            textAlign: "center",
           }}
         >
           {toast}
@@ -1027,17 +1239,17 @@ function IconButton({ children, onClick, label, active }) {
   );
 }
 
-function MessageBubble({ message, mine, isOpen, onToggleReactions, onReact }) {
+function MessageBubble({ message, mine, isOpen, onToggleMenu, onReact, onEdit, onUnsend }) {
   const [pressTimer, setPressTimer] = useState(null);
-  const startPress = () => setPressTimer(setTimeout(() => onToggleReactions(), 450));
+  const startPress = () => setPressTimer(setTimeout(() => onToggleMenu(), 450));
   const cancelPress = () => pressTimer && clearTimeout(pressTimer);
 
   return (
     <div style={{ display: "flex", justifyContent: mine ? "flex-end" : "flex-start", position: "relative" }}>
-      <div style={{ maxWidth: "70%", position: "relative" }}>
+      <div style={{ maxWidth: "78%", position: "relative" }}>
         <div
           className="pc-bubble-in"
-          onClick={onToggleReactions}
+          onClick={onToggleMenu}
           onMouseDown={startPress}
           onMouseUp={cancelPress}
           onMouseLeave={cancelPress}
@@ -1046,7 +1258,7 @@ function MessageBubble({ message, mine, isOpen, onToggleReactions, onReact }) {
           style={{
             background: BUBBLE_WHITE,
             borderRadius: mine ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
-            padding: "11px 15px",
+            padding: message.imageUrl || message.videoUrl ? 6 : "11px 15px",
             boxShadow: "0 2px 10px rgba(183,110,121,0.12)",
             border: mine ? "1px solid #FBE1E8" : "1px solid #F5F5F5",
             cursor: "pointer",
@@ -1054,22 +1266,60 @@ function MessageBubble({ message, mine, isOpen, onToggleReactions, onReact }) {
           }}
         >
           {!mine && (
-            <div style={{ fontSize: 11, fontWeight: 700, color: ROSE_GOLD, marginBottom: 3 }}>
+            <div
+              style={{
+                fontSize: 11,
+                fontWeight: 700,
+                color: ROSE_GOLD,
+                marginBottom: 3,
+                marginLeft: message.imageUrl || message.videoUrl ? 9 : 0,
+                marginTop: message.imageUrl || message.videoUrl ? 6 : 0,
+              }}
+            >
               {message.senderName}
             </div>
           )}
+
+          {message.imageUrl && (
+            <img
+              src={message.imageUrl}
+              alt=""
+              style={{ borderRadius: 12, maxWidth: "100%", display: "block", maxHeight: 320, objectFit: "cover" }}
+            />
+          )}
+          {message.videoUrl && (
+            <video src={message.videoUrl} controls style={{ borderRadius: 12, maxWidth: "100%", display: "block" }} />
+          )}
+          {message.audioUrl && (
+            <audio src={message.audioUrl} controls style={{ marginTop: 4, width: 220, display: "block" }} />
+          )}
           {message.text && (
-            <div style={{ fontSize: 14.5, color: TEXT_DEEP, lineHeight: 1.45, wordBreak: "break-word" }}>
+            <div
+              style={{
+                fontSize: 14.5,
+                color: TEXT_DEEP,
+                lineHeight: 1.45,
+                wordBreak: "break-word",
+                padding: message.imageUrl || message.videoUrl ? "8px 9px 0" : 0,
+              }}
+            >
               {message.text}
             </div>
           )}
-          {message.videoUrl && (
-            <video src={message.videoUrl} controls style={{ marginTop: 8, borderRadius: 12, maxWidth: "100%", display: "block" }} />
-          )}
-          {message.audioUrl && (
-            <audio src={message.audioUrl} controls style={{ marginTop: 8, width: 220 }} />
-          )}
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4, marginTop: 5 }}>
+
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "flex-end",
+              gap: 4,
+              marginTop: 5,
+              padding: message.imageUrl || message.videoUrl ? "0 9px 6px" : 0,
+            }}
+          >
+            {message.edited && (
+              <span style={{ fontSize: 10, color: TEXT_SOFT, fontStyle: "italic" }}>edited</span>
+            )}
             <span style={{ fontSize: 10.5, color: TEXT_SOFT }}>{fmtTime(message.timestamp)}</span>
             {mine && (message.read ? <CheckCheck size={13} color={READ_PINK} /> : <Check size={13} color="#C9B7BD" />)}
           </div>
@@ -1103,6 +1353,7 @@ function MessageBubble({ message, mine, isOpen, onToggleReactions, onReact }) {
               borderRadius: 999,
               padding: "6px 8px",
               display: "flex",
+              alignItems: "center",
               gap: 6,
               boxShadow: "0 4px 16px rgba(183,110,121,0.25)",
               border: `1px solid ${HEADER_PINK}`,
@@ -1121,12 +1372,37 @@ function MessageBubble({ message, mine, isOpen, onToggleReactions, onReact }) {
                 {emoji}
               </button>
             ))}
+            {mine && (
+              <>
+                <div style={{ width: 1, height: 18, background: "#F0DCE2" }} />
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onEdit();
+                  }}
+                  aria-label="Edit message"
+                  style={{ border: "none", background: "transparent", cursor: "pointer", color: ROSE_GOLD, display: "flex" }}
+                >
+                  <Pencil size={15} />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onUnsend();
+                  }}
+                  aria-label="Unsend message"
+                  style={{ border: "none", background: "transparent", cursor: "pointer", color: "#E24B7A", display: "flex" }}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </>
+            )}
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                onToggleReactions();
+                onToggleMenu();
               }}
-              style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_SOFT }}
+              style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_SOFT, display: "flex" }}
             >
               <X size={13} />
             </button>
