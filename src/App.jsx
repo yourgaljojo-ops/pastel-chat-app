@@ -39,6 +39,8 @@ export default function App() {
   const [profile, setProfile] = useState(null);
   const [authEmail, setAuthEmail] = useState("");
   const [authSent, setAuthSent] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [resendCooldown, setResendCooldown] = useState(0);
 
   // auth bootstrap
   useEffect(() => {
@@ -58,10 +60,26 @@ export default function App() {
   }, [session]);
 
   const sendMagicLink = async (e) => {
-    e.preventDefault();
-    await supabase.auth.signInWithOtp({ email: authEmail });
+    e?.preventDefault();
+    setAuthError("");
+    const { error } = await supabase.auth.signInWithOtp({ email: authEmail });
+    if (error) {
+      // Real failure — show it instead of silently claiming success.
+      // Common cases: "Error sending magic link email" (SMTP misconfigured),
+      // "email rate limit exceeded" (too many requests), invalid email format.
+      setAuthError(error.message || "Something went wrong sending the link. Try again.");
+      setAuthSent(false);
+      return;
+    }
     setAuthSent(true);
+    setResendCooldown(30);
   };
+
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const t = setInterval(() => setResendCooldown((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(t);
+  }, [resendCooldown]);
 
   if (!session) {
     return (
@@ -70,6 +88,12 @@ export default function App() {
         setEmail={setAuthEmail}
         onSubmit={sendMagicLink}
         sent={authSent}
+        error={authError}
+        resendCooldown={resendCooldown}
+        onEditEmail={() => {
+          setAuthSent(false);
+          setAuthError("");
+        }}
       />
     );
   }
@@ -79,7 +103,7 @@ export default function App() {
   return <ChatApp session={session} profile={profile} setProfile={setProfile} />;
 }
 
-function AuthScreen({ email, setEmail, onSubmit, sent }) {
+function AuthScreen({ email, setEmail, onSubmit, sent, error, resendCooldown, onEditEmail }) {
   return (
     <div
       style={{
@@ -93,8 +117,7 @@ function AuthScreen({ email, setEmail, onSubmit, sent }) {
         border: `1px solid ${HEADER_PINK}`,
       }}
     >
-      <form
-        onSubmit={onSubmit}
+      <div
         style={{
           background: "#fff",
           padding: 32,
@@ -115,12 +138,57 @@ function AuthScreen({ email, setEmail, onSubmit, sent }) {
         >
           our little chat
         </div>
+
         {sent ? (
-          <p style={{ color: TEXT_DEEP, fontSize: 14 }}>
-            Check your inbox — we sent {email} a magic sign-in link 💌
-          </p>
-        ) : (
           <>
+            <div style={{ fontSize: 34, marginBottom: 10 }}>💌</div>
+            <p style={{ color: TEXT_DEEP, fontSize: 14, marginBottom: 4 }}>
+              Check your inbox — we sent a sign-in link to
+            </p>
+            <p style={{ color: ROSE_GOLD, fontSize: 14, fontWeight: 700, marginBottom: 14 }}>
+              {email}
+            </p>
+            <p style={{ color: TEXT_SOFT, fontSize: 12, marginBottom: 18 }}>
+              Not seeing it? Check spam/junk — first emails from a new domain
+              sometimes land there. The link expires after a while, so use
+              the newest one if you request more than once.
+            </p>
+            <button
+              onClick={onSubmit}
+              disabled={resendCooldown > 0}
+              style={{
+                width: "100%",
+                padding: "9px 0",
+                borderRadius: 999,
+                border: `1px solid ${HEADER_PINK}`,
+                background: resendCooldown > 0 ? "#FDF1F5" : "#fff",
+                color: resendCooldown > 0 ? TEXT_SOFT : ROSE_GOLD,
+                fontWeight: 600,
+                fontSize: 13,
+                cursor: resendCooldown > 0 ? "default" : "pointer",
+                marginBottom: 8,
+              }}
+            >
+              {resendCooldown > 0 ? `Resend in ${resendCooldown}s` : "Resend link"}
+            </button>
+            <button
+              onClick={onEditEmail}
+              style={{
+                width: "100%",
+                padding: "6px 0",
+                border: "none",
+                background: "transparent",
+                color: TEXT_SOFT,
+                fontSize: 12,
+                cursor: "pointer",
+                textDecoration: "underline",
+              }}
+            >
+              Wrong email? Go back
+            </button>
+          </>
+        ) : (
+          <form onSubmit={onSubmit}>
             <input
               type="email"
               required
@@ -131,13 +199,18 @@ function AuthScreen({ email, setEmail, onSubmit, sent }) {
                 width: "100%",
                 padding: "10px 14px",
                 borderRadius: 999,
-                border: `1px solid ${HEADER_PINK}`,
-                marginBottom: 14,
+                border: `1px solid ${error ? "#E24B7A" : HEADER_PINK}`,
+                marginBottom: error ? 8 : 14,
                 outline: "none",
                 fontSize: 14,
                 boxSizing: "border-box",
               }}
             />
+            {error && (
+              <p style={{ color: "#E24B7A", fontSize: 12, marginBottom: 12, textAlign: "left" }}>
+                {error}
+              </p>
+            )}
             <button
               type="submit"
               style={{
@@ -153,9 +226,9 @@ function AuthScreen({ email, setEmail, onSubmit, sent }) {
             >
               Send magic link
             </button>
-          </>
+          </form>
         )}
-      </form>
+      </div>
     </div>
   );
 }
