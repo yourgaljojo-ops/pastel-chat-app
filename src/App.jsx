@@ -571,12 +571,41 @@ function ChatApp({ session, profile, setProfile }) {
 
   const mediaRecorderRef = useRef(null);
   const audioChunks = useRef([]);
+  const recordingMimeRef = useRef("audio/webm");
+
+  // Pick whichever audio format this browser can actually record.
+  // iOS Safari doesn't support webm at all — it records mp4/aac instead —
+  // so hardcoding "audio/webm" breaks playback specifically on iPhone.
+  const pickSupportedAudioMime = () => {
+    const candidates = [
+      "audio/mp4",
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg",
+    ];
+    for (const type of candidates) {
+      if (window.MediaRecorder?.isTypeSupported?.(type)) return type;
+    }
+    return ""; // let the browser pick its own default as a last resort
+  };
+
+  const extensionFor = (mime) => {
+    if (mime.includes("mp4")) return "m4a";
+    if (mime.includes("webm")) return "webm";
+    if (mime.includes("ogg")) return "ogg";
+    return "audio";
+  };
 
   const toggleRecording = async () => {
     if (!recording) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const recorder = new MediaRecorder(stream);
+        const mime = pickSupportedAudioMime();
+        recordingMimeRef.current = mime || "audio/webm";
+        const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        // MediaRecorder.mimeType reflects what the browser actually settled
+        // on, which can differ slightly from what we requested — trust it.
+        recordingMimeRef.current = recorder.mimeType || recordingMimeRef.current;
         audioChunks.current = [];
         recorder.ondataavailable = (e) => audioChunks.current.push(e.data);
         recorder.start();
@@ -589,9 +618,12 @@ function ChatApp({ session, profile, setProfile }) {
     } else {
       const recorder = mediaRecorderRef.current;
       recorder.onstop = async () => {
-        const blob = new Blob(audioChunks.current, { type: "audio/webm" });
-        const path = `${myId}/${Date.now()}-voice.webm`;
-        const { error: upErr } = await supabase.storage.from("chat-media").upload(path, blob);
+        const mime = recordingMimeRef.current;
+        const blob = new Blob(audioChunks.current, { type: mime });
+        const path = `${myId}/${Date.now()}-voice.${extensionFor(mime)}`;
+        const { error: upErr } = await supabase.storage
+          .from("chat-media")
+          .upload(path, blob, { contentType: mime });
         if (upErr) return showToast("Voice note upload failed");
         const { data } = supabase.storage.from("chat-media").getPublicUrl(path);
         await insertMessage({ audio_url: data.publicUrl });
