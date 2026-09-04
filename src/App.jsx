@@ -39,9 +39,10 @@ export default function App() {
   const [sessionChecked, setSessionChecked] = useState(false);
   const [profile, setProfile] = useState(null);
   const [authEmail, setAuthEmail] = useState("");
-  const [authSent, setAuthSent] = useState(false);
+  const [authStep, setAuthStep] = useState("email"); // "email" | "code"
   const [authError, setAuthError] = useState("");
   const [resendCooldown, setResendCooldown] = useState(0);
+  const [verifying, setVerifying] = useState(false);
 
   // auth bootstrap — wait for the initial check to actually finish before
   // deciding whether to show the login screen, so a refresh never flashes
@@ -68,20 +69,32 @@ export default function App() {
       .then(({ data }) => data && setProfile(data));
   }, [session]);
 
-  const sendMagicLink = async (e) => {
+  const sendCode = async (e) => {
     e?.preventDefault();
     setAuthError("");
     const { error } = await supabase.auth.signInWithOtp({ email: authEmail });
     if (error) {
-      // Real failure — show it instead of silently claiming success.
-      // Common cases: "Error sending magic link email" (SMTP misconfigured),
-      // "email rate limit exceeded" (too many requests), invalid email format.
-      setAuthError(error.message || "Something went wrong sending the link. Try again.");
-      setAuthSent(false);
+      setAuthError(error.message || "Something went wrong sending the code. Try again.");
       return;
     }
-    setAuthSent(true);
+    setAuthStep("code");
     setResendCooldown(30);
+  };
+
+  const verifyCode = async (code) => {
+    setAuthError("");
+    setVerifying(true);
+    const { error } = await supabase.auth.verifyOtp({
+      email: authEmail,
+      token: code,
+      type: "email",
+    });
+    setVerifying(false);
+    if (error) {
+      setAuthError(error.message || "That code didn't work — check it and try again.");
+      return false;
+    }
+    return true; // onAuthStateChange picks up the new session from here
   };
 
   useEffect(() => {
@@ -97,12 +110,15 @@ export default function App() {
       <AuthScreen
         email={authEmail}
         setEmail={setAuthEmail}
-        onSubmit={sendMagicLink}
-        sent={authSent}
+        step={authStep}
+        onSendCode={sendCode}
+        onVerifyCode={verifyCode}
+        verifying={verifying}
         error={authError}
+        clearError={() => setAuthError("")}
         resendCooldown={resendCooldown}
         onEditEmail={() => {
-          setAuthSent(false);
+          setAuthStep("email");
           setAuthError("");
         }}
       />
@@ -114,27 +130,70 @@ export default function App() {
   return <ChatApp session={session} profile={profile} setProfile={setProfile} />;
 }
 
-function AuthScreen({ email, setEmail, onSubmit, sent, error, resendCooldown, onEditEmail }) {
+const authStyles = `
+  @import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&display=swap');
+  @keyframes floatBlob { 0%,100% { transform: translate(0,0) scale(1); } 50% { transform: translate(14px,-18px) scale(1.06); } }
+  @keyframes cardIn { from { opacity: 0; transform: translateY(10px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+  @keyframes shakeX { 10%,90% { transform: translateX(-1px); } 20%,80% { transform: translateX(2px); } 30%,50%,70% { transform: translateX(-4px); } 40%,60% { transform: translateX(4px); } }
+  @keyframes popIn { from { opacity: 0; transform: scale(0.8); } to { opacity: 1; transform: scale(1); } }
+  .auth-card { animation: cardIn .4s ease; }
+  .auth-shake { animation: shakeX .45s ease; }
+  .auth-blob { position: absolute; border-radius: 50%; filter: blur(40px); opacity: 0.55; animation: floatBlob 7s ease-in-out infinite; }
+  .otp-box {
+    width: 46px; height: 56px; text-align: center; font-size: 22px; font-weight: 700;
+    border-radius: 14px; border: 1.5px solid #FFB6C1; outline: none; color: #6B4A57;
+    background: #fff; transition: border-color .18s ease, box-shadow .18s ease, transform .12s ease;
+  }
+  .otp-box:focus { border-color: #B76E79; box-shadow: 0 0 0 4px rgba(183,110,121,0.15); transform: translateY(-1px); }
+  .auth-btn { transition: transform .15s ease, box-shadow .15s ease; }
+  .auth-btn:active { transform: scale(0.97); }
+  .auth-btn:hover:not(:disabled) { box-shadow: 0 6px 18px rgba(183,110,121,0.3); }
+`;
+
+function AuthScreen({
+  email,
+  setEmail,
+  step,
+  onSendCode,
+  onVerifyCode,
+  verifying,
+  error,
+  clearError,
+  resendCooldown,
+  onEditEmail,
+}) {
   return (
     <div
       style={{
-        minHeight: 500,
+        minHeight: 520,
+        position: "relative",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        background: BLUSH_BG,
+        background: `linear-gradient(160deg, ${BLUSH_BG} 0%, #FFE4EC 100%)`,
         fontFamily: "'Quicksand','Poppins',sans-serif",
         borderRadius: 20,
         border: `1px solid ${HEADER_PINK}`,
+        overflow: "hidden",
       }}
     >
+      <style>{authStyles}</style>
+
+      {/* soft floating background blobs for depth */}
+      <div className="auth-blob" style={{ width: 180, height: 180, background: "#FFC1CC", top: -50, left: -40 }} />
+      <div className="auth-blob" style={{ width: 220, height: 220, background: "#E8B4BE", bottom: -70, right: -60, animationDelay: "1.5s" }} />
+      <div className="auth-blob" style={{ width: 120, height: 120, background: "#FFD9E4", top: "40%", right: 10, animationDelay: "3s" }} />
+
       <div
+        className="auth-card"
         style={{
-          background: "#fff",
-          padding: 32,
-          borderRadius: 18,
-          boxShadow: "0 10px 30px rgba(183,110,121,0.18)",
-          width: 300,
+          position: "relative",
+          background: "rgba(255,255,255,0.9)",
+          backdropFilter: "blur(6px)",
+          padding: 34,
+          borderRadius: 20,
+          boxShadow: "0 14px 40px rgba(183,110,121,0.2)",
+          width: 320,
           textAlign: "center",
         }}
       >
@@ -142,104 +201,210 @@ function AuthScreen({ email, setEmail, onSubmit, sent, error, resendCooldown, on
           style={{
             fontFamily: "'Cormorant Garamond',serif",
             fontStyle: "italic",
-            fontSize: 24,
+            fontSize: 25,
             color: ROSE_GOLD,
-            marginBottom: 18,
+            marginBottom: 6,
           }}
         >
           our little chat
         </div>
+        <div style={{ fontSize: 12, color: TEXT_SOFT, marginBottom: 22 }}>
+          {step === "email" ? "Sign in to keep chatting 💌" : "Enter the code we just sent you"}
+        </div>
 
-        {sent ? (
-          <>
-            <div style={{ fontSize: 34, marginBottom: 10 }}>💌</div>
-            <p style={{ color: TEXT_DEEP, fontSize: 14, marginBottom: 4 }}>
-              Check your inbox — we sent a sign-in link to
-            </p>
-            <p style={{ color: ROSE_GOLD, fontSize: 14, fontWeight: 700, marginBottom: 14 }}>
-              {email}
-            </p>
-            <p style={{ color: TEXT_SOFT, fontSize: 12, marginBottom: 18 }}>
-              Not seeing it? Check spam/junk — first emails from a new domain
-              sometimes land there. The link expires after a while, so use
-              the newest one if you request more than once.
-            </p>
-            <button
-              onClick={onSubmit}
-              disabled={resendCooldown > 0}
-              style={{
-                width: "100%",
-                padding: "9px 0",
-                borderRadius: 999,
-                border: `1px solid ${HEADER_PINK}`,
-                background: resendCooldown > 0 ? "#FDF1F5" : "#fff",
-                color: resendCooldown > 0 ? TEXT_SOFT : ROSE_GOLD,
-                fontWeight: 600,
-                fontSize: 13,
-                cursor: resendCooldown > 0 ? "default" : "pointer",
-                marginBottom: 8,
-              }}
-            >
-              {resendCooldown > 0 ? `Resend in ${resendCooldown}s` : "Resend link"}
-            </button>
-            <button
-              onClick={onEditEmail}
-              style={{
-                width: "100%",
-                padding: "6px 0",
-                border: "none",
-                background: "transparent",
-                color: TEXT_SOFT,
-                fontSize: 12,
-                cursor: "pointer",
-                textDecoration: "underline",
-              }}
-            >
-              Wrong email? Go back
-            </button>
-          </>
+        {step === "email" ? (
+          <EmailStep email={email} setEmail={setEmail} onSubmit={onSendCode} error={error} />
         ) : (
-          <form onSubmit={onSubmit}>
-            <input
-              type="email"
-              required
-              placeholder="you@example.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              style={{
-                width: "100%",
-                padding: "10px 14px",
-                borderRadius: 999,
-                border: `1px solid ${error ? "#E24B7A" : HEADER_PINK}`,
-                marginBottom: error ? 8 : 14,
-                outline: "none",
-                fontSize: 14,
-                boxSizing: "border-box",
-              }}
-            />
-            {error && (
-              <p style={{ color: "#E24B7A", fontSize: 12, marginBottom: 12, textAlign: "left" }}>
-                {error}
-              </p>
-            )}
-            <button
-              type="submit"
-              style={{
-                width: "100%",
-                padding: "10px 0",
-                borderRadius: 999,
-                border: "none",
-                background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
-                color: "#fff",
-                fontWeight: 600,
-                cursor: "pointer",
-              }}
-            >
-              Send magic link
-            </button>
-          </form>
+          <CodeStep
+            email={email}
+            onVerify={onVerifyCode}
+            onResend={onSendCode}
+            verifying={verifying}
+            error={error}
+            clearError={clearError}
+            resendCooldown={resendCooldown}
+            onEditEmail={onEditEmail}
+          />
         )}
       </div>
+    </div>
+  );
+}
+
+function EmailStep({ email, setEmail, onSubmit, error }) {
+  return (
+    <form onSubmit={onSubmit}>
+      <input
+        type="email"
+        required
+        autoFocus
+        placeholder="you@example.com"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+        style={{
+          width: "100%",
+          padding: "12px 16px",
+          borderRadius: 999,
+          border: `1.5px solid ${error ? "#E24B7A" : HEADER_PINK}`,
+          marginBottom: error ? 8 : 16,
+          outline: "none",
+          fontSize: 14,
+          boxSizing: "border-box",
+          fontFamily: "inherit",
+          transition: "border-color .18s ease, box-shadow .18s ease",
+        }}
+        onFocus={(e) => (e.target.style.boxShadow = "0 0 0 4px rgba(183,110,121,0.15)")}
+        onBlur={(e) => (e.target.style.boxShadow = "none")}
+      />
+      {error && (
+        <p style={{ color: "#E24B7A", fontSize: 12, marginBottom: 12, textAlign: "left" }}>{error}</p>
+      )}
+      <button
+        type="submit"
+        className="auth-btn"
+        style={{
+          width: "100%",
+          padding: "12px 0",
+          borderRadius: 999,
+          border: "none",
+          background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+          color: "#fff",
+          fontWeight: 700,
+          fontSize: 14,
+          cursor: "pointer",
+          letterSpacing: 0.3,
+        }}
+      >
+        Send my code ✨
+      </button>
+    </form>
+  );
+}
+
+function CodeStep({ email, onVerify, onResend, verifying, error, clearError, resendCooldown, onEditEmail }) {
+  const [digits, setDigits] = useState(["", "", "", "", "", ""]);
+  const [shake, setShake] = useState(false);
+  const inputRefs = useRef([]);
+
+  useEffect(() => {
+    inputRefs.current[0]?.focus();
+  }, []);
+
+  const triggerShake = () => {
+    setShake(true);
+    setTimeout(() => setShake(false), 450);
+  };
+
+  const attemptVerify = async (fullCode) => {
+    const ok = await onVerify(fullCode);
+    if (!ok) {
+      triggerShake();
+      setDigits(["", "", "", "", "", ""]);
+      inputRefs.current[0]?.focus();
+    }
+  };
+
+  const handleChange = (i, val) => {
+    if (error) clearError();
+    const v = val.replace(/[^0-9]/g, "");
+    if (!v) {
+      const next = [...digits];
+      next[i] = "";
+      setDigits(next);
+      return;
+    }
+    const next = [...digits];
+    next[i] = v[v.length - 1];
+    setDigits(next);
+    if (i < 5) inputRefs.current[i + 1]?.focus();
+    if (next.every((d) => d !== "")) attemptVerify(next.join(""));
+  };
+
+  const handleKeyDown = (i, e) => {
+    if (e.key === "Backspace" && !digits[i] && i > 0) {
+      inputRefs.current[i - 1]?.focus();
+    }
+  };
+
+  const handlePaste = (e) => {
+    const text = e.clipboardData.getData("text").replace(/[^0-9]/g, "").slice(0, 6);
+    if (!text) return;
+    e.preventDefault();
+    const next = ["", "", "", "", "", ""];
+    for (let i = 0; i < text.length; i++) next[i] = text[i];
+    setDigits(next);
+    const lastFilled = Math.min(text.length, 6) - 1;
+    inputRefs.current[Math.min(lastFilled + 1, 5)]?.focus();
+    if (text.length === 6) attemptVerify(text);
+  };
+
+  return (
+    <div>
+      <p style={{ fontSize: 12, color: TEXT_SOFT, marginBottom: 4 }}>Code sent to</p>
+      <p style={{ fontSize: 13, color: ROSE_GOLD, fontWeight: 700, marginBottom: 18 }}>{email}</p>
+
+      <div
+        className={shake ? "auth-shake" : ""}
+        style={{ display: "flex", gap: 8, justifyContent: "center", marginBottom: 14 }}
+        onPaste={handlePaste}
+      >
+        {digits.map((d, i) => (
+          <input
+            key={i}
+            ref={(el) => (inputRefs.current[i] = el)}
+            className="otp-box"
+            type="text"
+            inputMode="numeric"
+            maxLength={1}
+            value={d}
+            disabled={verifying}
+            onChange={(e) => handleChange(i, e.target.value)}
+            onKeyDown={(e) => handleKeyDown(i, e)}
+          />
+        ))}
+      </div>
+
+      {verifying && <p style={{ fontSize: 12, color: TEXT_SOFT, marginBottom: 10 }}>Verifying…</p>}
+      {error && (
+        <p style={{ color: "#E24B7A", fontSize: 12, marginBottom: 10, animation: "popIn .2s ease" }}>
+          {error}
+        </p>
+      )}
+
+      <button
+        onClick={onResend}
+        disabled={resendCooldown > 0}
+        className="auth-btn"
+        style={{
+          width: "100%",
+          padding: "9px 0",
+          borderRadius: 999,
+          border: `1px solid ${HEADER_PINK}`,
+          background: resendCooldown > 0 ? "#FDF1F5" : "#fff",
+          color: resendCooldown > 0 ? TEXT_SOFT : ROSE_GOLD,
+          fontWeight: 600,
+          fontSize: 13,
+          cursor: resendCooldown > 0 ? "default" : "pointer",
+          marginBottom: 8,
+        }}
+      >
+        {resendCooldown > 0 ? `Resend in ${resendCooldown}s` : "Resend code"}
+      </button>
+      <button
+        onClick={onEditEmail}
+        style={{
+          width: "100%",
+          padding: "6px 0",
+          border: "none",
+          background: "transparent",
+          color: TEXT_SOFT,
+          fontSize: 12,
+          cursor: "pointer",
+          textDecoration: "underline",
+        }}
+      >
+        Wrong email? Go back
+      </button>
     </div>
   );
 }
