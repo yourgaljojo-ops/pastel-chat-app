@@ -2,11 +2,24 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>our little chat</title>
+    <style>
+      html, body, #root {
+        height: 100%;
+        min-height: 100dvh;
+      }
+      body {
+        margin: 0;
+        background: #FFF0F5;
+        overscroll-behavior-y: none;
+      }
+    </style>
   </head>
-  <body style="margin:0; padding:24px; background:#FFF0F5; display:flex; align-items:center; justify-content:center; min-height:100vh; box-sizing:border-box;">
-    <div id="root" style="width:100%; max-width:960px;"></div>
+  <body>
+    <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
