@@ -1,0 +1,36 @@
+name: Visual Snapshot
+
+# Runs after every push to main, and can also be triggered manually
+# from the Actions tab in GitHub whenever you want a fresh screenshot.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  screenshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright
+        run: |
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Take screenshot of live site
+        run: node scripts/screenshot.mjs
+        env:
+          SCREENSHOT_URL: https://pastel-chat-app.vercel.app
+
+      - name: Commit screenshot back to repo
+        run: |
+          git config user.name "visual-snapshot-bot"
+          git config user.email "actions@github.com"
+          git add screenshots/
+          git diff --staged --quiet || git commit -m "chore: update visual snapshot [skip ci]"
+          git push
