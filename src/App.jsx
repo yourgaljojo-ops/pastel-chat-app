@@ -11,6 +11,7 @@ import {
   Menu,
   Pencil,
   Trash2,
+  Reply,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
@@ -30,7 +31,13 @@ const BUBBLE_WHITE = "#FFFFFF";
 const TEXT_DEEP = "#6B4A57";
 const TEXT_SOFT = "#A8828F";
 const READ_PINK = "#F49AC2";
-const REACTIONS = ["💖", "✨", "😭"];
+const REACTIONS = ["💖", "✨", "😭"]; // quick-tap favorites, shown first
+const EMOJI_GRID = [
+  "💖", "✨", "😭", "😍", "🥹", "😂", "🤣", "🙈",
+  "🥺", "😘", "🫶", "💅", "👑", "🎀", "🌸", "🌷",
+  "🍒", "🧁", "🍓", "🦋", "⭐️", "🔥", "💯", "🙌",
+  "👏", "😅", "😊", "🥰", "😌", "🤍", "💗", "💞",
+];
 
 const fmtTime = (iso) =>
   new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -59,6 +66,9 @@ const rowToMessage = (row) => ({
   read: row.read,
   edited: !!row.edited,
   reactions: row.reactions || [],
+  replyToId: row.reply_to_id || undefined,
+  replyToText: row.reply_to_text || undefined,
+  replyToSender: row.reply_to_sender || undefined,
 });
 
 export default function App() {
@@ -481,6 +491,8 @@ function ChatApp({ session, profile, setProfile }) {
   const [friendProfile, setFriendProfile] = useState(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [editingMessage, setEditingMessage] = useState(null); // { id, text } | null
+  const [friendOnline, setFriendOnline] = useState(false);
+  const [replyingTo, setReplyingTo] = useState(null); // { id, text, senderName } | null
 
   const scrollRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -576,6 +588,24 @@ function ChatApp({ session, profile, setProfile }) {
     });
   }, [myId]);
 
+  // real online/offline presence — replaces the old hardcoded "online" label
+  useEffect(() => {
+    const channel = supabase.channel("presence-room", {
+      config: { presence: { key: myId } },
+    });
+    channel.on("presence", { event: "sync" }, () => {
+      const state = channel.presenceState();
+      const someoneElseOnline = Object.keys(state).some((key) => key !== myId);
+      setFriendOnline(someoneElseOnline);
+    });
+    channel.subscribe(async (status) => {
+      if (status === "SUBSCRIBED") {
+        await channel.track({ online_at: new Date().toISOString() });
+      }
+    });
+    return () => supabase.removeChannel(channel);
+  }, [myId]);
+
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages, friendTyping]);
@@ -598,6 +628,13 @@ function ChatApp({ session, profile, setProfile }) {
       sender_name: profile.nickname,
       read: false,
       reactions: [],
+      ...(replyingTo
+        ? {
+            reply_to_id: replyingTo.id,
+            reply_to_text: replyingTo.text,
+            reply_to_sender: replyingTo.senderName,
+          }
+        : {}),
       ...fields,
     });
     if (error) {
@@ -607,6 +644,32 @@ function ChatApp({ session, profile, setProfile }) {
       return;
     }
     setDraft("");
+    setReplyingTo(null);
+  };
+
+  const startReply = (message) => {
+    setReplyingTo({
+      id: message.id,
+      text: message.imageUrl ? "📷 Photo" : message.videoUrl ? "🎬 Video" : message.audioUrl ? "🎤 Voice note" : message.text,
+      senderName: message.senderId === myId ? profile.nickname : friendProfile?.nickname || message.senderName,
+    });
+    setEditingMessage(null);
+    setOpenMenuFor(null);
+    composerRef.current?.focus();
+  };
+
+  const cancelReply = () => setReplyingTo(null);
+
+  const jumpToMessage = (id) => {
+    const el = document.getElementById(`msg-${id}`);
+    if (!el) {
+      showToast("That message isn't loaded here");
+      return;
+    }
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.style.transition = "background-color 0.3s ease";
+    el.style.backgroundColor = "#FFE4EC";
+    setTimeout(() => (el.style.backgroundColor = "transparent"), 900);
   };
 
   const saveEdit = async () => {
@@ -640,6 +703,7 @@ function ChatApp({ session, profile, setProfile }) {
 
   const startEdit = (message) => {
     setEditingMessage({ id: message.id, text: message.text });
+    setReplyingTo(null);
     setDraft(message.text);
     setOpenMenuFor(null);
     composerRef.current?.focus();
@@ -834,7 +898,9 @@ function ChatApp({ session, profile, setProfile }) {
           <div style={{ fontWeight: 700, color: "#6B2F44", fontSize: 15, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
             {friendProfile?.nickname || "Waiting for your friend…"}
           </div>
-          <div style={{ fontSize: 11, color: "#8A4A5D" }}>{friendTyping ? "typing…" : "online"}</div>
+          <div style={{ fontSize: 11, color: "#8A4A5D" }}>
+            {friendTyping ? "typing…" : friendOnline ? "online" : "offline"}
+          </div>
         </div>
       </div>
 
@@ -873,6 +939,8 @@ function ChatApp({ session, profile, setProfile }) {
               key={item.key}
               message={item.message}
               mine={item.message.senderId === myId}
+              displayName={item.message.senderId === myId ? profile.nickname : friendProfile?.nickname || item.message.senderName}
+              avatarUrl={item.message.senderId === myId ? profile.avatar_url : friendProfile?.avatar_url}
               isOpen={openMenuFor === item.message.id}
               onToggleMenu={() =>
                 setOpenMenuFor(openMenuFor === item.message.id ? null : item.message.id)
@@ -880,6 +948,8 @@ function ChatApp({ session, profile, setProfile }) {
               onReact={(emoji) => addReaction(item.message, emoji)}
               onEdit={() => startEdit(item.message)}
               onUnsend={() => unsendMessage(item.message)}
+              onReply={() => startReply(item.message)}
+              onJumpToQuoted={() => item.message.replyToId && jumpToMessage(item.message.replyToId)}
             />
           )
         )}
@@ -944,6 +1014,48 @@ function ChatApp({ session, profile, setProfile }) {
               style={{ border: "none", background: "transparent", color: TEXT_SOFT, cursor: "pointer" }}
             >
               <X size={14} />
+            </button>
+          </div>
+        )}
+        {replyingTo && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "8px 16px 0",
+            }}
+          >
+            <div
+              style={{
+                flex: 1,
+                background: "#fff",
+                borderLeft: `3px solid ${ROSE_GOLD}`,
+                borderRadius: 8,
+                padding: "6px 10px",
+                minWidth: 0,
+              }}
+            >
+              <div style={{ fontSize: 11, fontWeight: 700, color: ROSE_GOLD }}>
+                Replying to {replyingTo.senderName}
+              </div>
+              <div
+                style={{
+                  fontSize: 12,
+                  color: TEXT_SOFT,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                }}
+              >
+                {replyingTo.text}
+              </div>
+            </div>
+            <button
+              onClick={cancelReply}
+              style={{ border: "none", background: "transparent", color: TEXT_SOFT, cursor: "pointer" }}
+            >
+              <X size={16} />
             </button>
           </div>
         )}
@@ -1239,13 +1351,37 @@ function IconButton({ children, onClick, label, active }) {
   );
 }
 
-function MessageBubble({ message, mine, isOpen, onToggleMenu, onReact, onEdit, onUnsend }) {
+function MessageBubble({
+  message,
+  mine,
+  displayName,
+  avatarUrl,
+  isOpen,
+  onToggleMenu,
+  onReact,
+  onEdit,
+  onUnsend,
+  onReply,
+  onJumpToQuoted,
+}) {
   const [pressTimer, setPressTimer] = useState(null);
+  const [showFullPicker, setShowFullPicker] = useState(false);
   const startPress = () => setPressTimer(setTimeout(() => onToggleMenu(), 450));
   const cancelPress = () => pressTimer && clearTimeout(pressTimer);
 
   return (
-    <div style={{ display: "flex", justifyContent: mine ? "flex-end" : "flex-start", position: "relative" }}>
+    <div
+      id={`msg-${message.id}`}
+      style={{
+        display: "flex",
+        justifyContent: mine ? "flex-end" : "flex-start",
+        alignItems: "flex-end",
+        gap: 6,
+        position: "relative",
+        borderRadius: 14,
+      }}
+    >
+      {!mine && <Avatar url={avatarUrl} name={displayName} size={24} />}
       <div style={{ maxWidth: "78%", position: "relative" }}>
         <div
           className="pc-bubble-in"
@@ -1276,7 +1412,42 @@ function MessageBubble({ message, mine, isOpen, onToggleMenu, onReact, onEdit, o
                 marginTop: message.imageUrl || message.videoUrl ? 6 : 0,
               }}
             >
-              {message.senderName}
+              {displayName}
+            </div>
+          )}
+
+          {message.replyToText && (
+            <div
+              onClick={(e) => {
+                e.stopPropagation();
+                onJumpToQuoted();
+              }}
+              style={{
+                background: "#FFF5F8",
+                borderLeft: `3px solid ${ROSE_GOLD}`,
+                borderRadius: 6,
+                padding: "5px 8px",
+                marginBottom: 6,
+                marginLeft: message.imageUrl || message.videoUrl ? 9 : 0,
+                marginRight: message.imageUrl || message.videoUrl ? 9 : 0,
+                marginTop: message.imageUrl || message.videoUrl ? 6 : 0,
+                cursor: "pointer",
+              }}
+            >
+              <div style={{ fontSize: 10.5, fontWeight: 700, color: ROSE_GOLD }}>
+                {message.replyToSender}
+              </div>
+              <div
+                style={{
+                  fontSize: 11.5,
+                  color: TEXT_SOFT,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                }}
+              >
+                {message.replyToText}
+              </div>
             </div>
           )}
 
@@ -1349,63 +1520,144 @@ function MessageBubble({ message, mine, isOpen, onToggleMenu, onReact, onEdit, o
               position: "absolute",
               top: -46,
               [mine ? "right" : "left"]: 0,
-              background: "#fff",
-              borderRadius: 999,
-              padding: "6px 8px",
-              display: "flex",
-              alignItems: "center",
-              gap: 6,
-              boxShadow: "0 4px 16px rgba(183,110,121,0.25)",
-              border: `1px solid ${HEADER_PINK}`,
               zIndex: 5,
             }}
           >
-            {REACTIONS.map((emoji) => (
+            <div
+              style={{
+                background: "#fff",
+                borderRadius: 999,
+                padding: "6px 8px",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                boxShadow: "0 4px 16px rgba(183,110,121,0.25)",
+                border: `1px solid ${HEADER_PINK}`,
+              }}
+            >
+              {REACTIONS.map((emoji) => (
+                <button
+                  key={emoji}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onReact(emoji);
+                  }}
+                  style={{ border: "none", background: "transparent", fontSize: 17, cursor: "pointer", lineHeight: 1 }}
+                >
+                  {emoji}
+                </button>
+              ))}
               <button
-                key={emoji}
                 onClick={(e) => {
                   e.stopPropagation();
-                  onReact(emoji);
+                  setShowFullPicker((s) => !s);
                 }}
-                style={{ border: "none", background: "transparent", fontSize: 17, cursor: "pointer", lineHeight: 1 }}
+                aria-label="More emoji"
+                style={{
+                  border: "none",
+                  background: showFullPicker ? "#FFE4EC" : "transparent",
+                  cursor: "pointer",
+                  color: ROSE_GOLD,
+                  fontSize: 15,
+                  fontWeight: 700,
+                  width: 22,
+                  height: 22,
+                  borderRadius: "50%",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
               >
-                {emoji}
+                +
               </button>
-            ))}
-            {mine && (
-              <>
-                <div style={{ width: 1, height: 18, background: "#F0DCE2" }} />
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onEdit();
-                  }}
-                  aria-label="Edit message"
-                  style={{ border: "none", background: "transparent", cursor: "pointer", color: ROSE_GOLD, display: "flex" }}
-                >
-                  <Pencil size={15} />
-                </button>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onUnsend();
-                  }}
-                  aria-label="Unsend message"
-                  style={{ border: "none", background: "transparent", cursor: "pointer", color: "#E24B7A", display: "flex" }}
-                >
-                  <Trash2 size={15} />
-                </button>
-              </>
+              <div style={{ width: 1, height: 18, background: "#F0DCE2" }} />
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onReply();
+                }}
+                aria-label="Reply"
+                style={{ border: "none", background: "transparent", cursor: "pointer", color: ROSE_GOLD, display: "flex" }}
+              >
+                <Reply size={15} />
+              </button>
+              {mine && (
+                <>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onEdit();
+                    }}
+                    aria-label="Edit message"
+                    style={{ border: "none", background: "transparent", cursor: "pointer", color: ROSE_GOLD, display: "flex" }}
+                  >
+                    <Pencil size={15} />
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onUnsend();
+                    }}
+                    aria-label="Unsend message"
+                    style={{ border: "none", background: "transparent", cursor: "pointer", color: "#E24B7A", display: "flex" }}
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                </>
+              )}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleMenu();
+                }}
+                style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_SOFT, display: "flex" }}
+              >
+                <X size={13} />
+              </button>
+            </div>
+
+            {showFullPicker && (
+              <div
+                className="pc-bubble-in"
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  position: "absolute",
+                  top: 42,
+                  [mine ? "right" : "left"]: 0,
+                  background: "#fff",
+                  borderRadius: 16,
+                  padding: 10,
+                  display: "grid",
+                  gridTemplateColumns: "repeat(8, 1fr)",
+                  gap: 2,
+                  width: 240,
+                  boxShadow: "0 4px 16px rgba(183,110,121,0.25)",
+                  border: `1px solid ${HEADER_PINK}`,
+                }}
+              >
+                {EMOJI_GRID.map((emoji) => (
+                  <button
+                    key={emoji}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onReact(emoji);
+                      setShowFullPicker(false);
+                    }}
+                    style={{
+                      border: "none",
+                      background: "transparent",
+                      fontSize: 18,
+                      cursor: "pointer",
+                      lineHeight: 1,
+                      padding: 4,
+                      borderRadius: 8,
+                    }}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
             )}
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onToggleMenu();
-              }}
-              style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_SOFT, display: "flex" }}
-            >
-              <X size={13} />
-            </button>
           </div>
         )}
       </div>
