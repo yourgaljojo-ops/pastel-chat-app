@@ -492,6 +492,7 @@ function ChatApp({ session, profile, setProfile }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [editingMessage, setEditingMessage] = useState(null); // { id, text } | null
   const [friendOnline, setFriendOnline] = useState(false);
+  const [notifStatus, setNotifStatus] = useState("checking"); // checking | unsupported | needs-install | default | granted | subscribed
   const [replyingTo, setReplyingTo] = useState(null); // { id, text, senderName } | null
 
   const scrollRef = useRef(null);
@@ -506,6 +507,66 @@ function ChatApp({ session, profile, setProfile }) {
   const showToast = (t) => {
     setToast(t);
     setTimeout(() => setToast(""), 2200);
+  };
+
+  // Check where things stand for push notifications, without prompting —
+  // the actual permission request only happens on an explicit tap (both
+  // iOS's rules and good practice require a user gesture for this).
+  useEffect(() => {
+    const isStandalone =
+      window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+    const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setNotifStatus("unsupported");
+    } else if (isIOS && !isStandalone) {
+      // iOS Safari flatly refuses push unless the site was added to the
+      // Home Screen first — no permission prompt will work otherwise.
+      setNotifStatus("needs-install");
+    } else if (Notification.permission === "granted") {
+      setNotifStatus("granted");
+    } else {
+      setNotifStatus("default");
+    }
+  }, []);
+
+  const urlBase64ToUint8Array = (base64String) => {
+    const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+    const rawData = window.atob(base64);
+    return Uint8Array.from([...rawData].map((c) => c.charCodeAt(0)));
+  };
+
+  const enableNotifications = async () => {
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        setNotifStatus("default");
+        showToast("Notifications weren't allowed");
+        return;
+      }
+      const registration = await navigator.serviceWorker.ready;
+      const vapidKey = import.meta.env.VITE_VAPID_PUBLIC_KEY;
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(vapidKey),
+      });
+      const json = subscription.toJSON();
+      const { error } = await supabase.from("push_subscriptions").upsert(
+        {
+          user_id: myId,
+          endpoint: json.endpoint,
+          p256dh: json.keys.p256dh,
+          auth: json.keys.auth,
+        },
+        { onConflict: "endpoint" }
+      );
+      if (error) throw error;
+      setNotifStatus("subscribed");
+      showToast("Notifications turned on 🔔");
+    } catch (err) {
+      showToast("Couldn't turn on notifications");
+    }
   };
 
   // initial message load
@@ -1215,6 +1276,41 @@ function ChatApp({ session, profile, setProfile }) {
           <div style={{ fontSize: 14, fontWeight: 600, color: TEXT_DEEP }}>
             {friendProfile?.nickname || "waiting to join…"}
           </div>
+        </div>
+
+        <div style={{ height: 1, background: HEADER_PINK, opacity: 0.6 }} />
+
+        <div style={{ textAlign: "center" }}>
+          {notifStatus === "subscribed" || notifStatus === "granted" ? (
+            <div style={{ fontSize: 12, color: TEXT_SOFT }}>🔔 Notifications are on</div>
+          ) : notifStatus === "needs-install" ? (
+            <div style={{ fontSize: 11.5, color: TEXT_SOFT, lineHeight: 1.5 }}>
+              To get notifications on iPhone: tap the Share icon in Safari, then
+              <strong style={{ color: ROSE_GOLD }}> "Add to Home Screen"</strong> — open it from
+              there instead of Safari to turn them on.
+            </div>
+          ) : notifStatus === "unsupported" ? (
+            <div style={{ fontSize: 11.5, color: TEXT_SOFT }}>
+              This browser doesn't support notifications
+            </div>
+          ) : notifStatus === "default" ? (
+            <button
+              onClick={enableNotifications}
+              className="pc-icon-btn"
+              style={{
+                border: "none",
+                borderRadius: 999,
+                padding: "9px 18px",
+                background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+                color: "#fff",
+                fontWeight: 600,
+                fontSize: 13,
+                cursor: "pointer",
+              }}
+            >
+              🔔 Turn on notifications
+            </button>
+          ) : null}
         </div>
 
         <div style={{ marginTop: "auto", textAlign: "center" }}>
