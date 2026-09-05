@@ -520,15 +520,20 @@ function ChatApp({ session, profile, setProfile }) {
       });
   }, []);
 
-  // load the other person's profile (first profile that isn't mine)
+  // Identify the friend as "whoever actually sent me a message" instead
+  // of an arbitrary other row in profiles — leftover test accounts from
+  // earlier debugging (miss.cherryie, lamanna, testbot, etc.) made "any
+  // other row" ambiguous and occasionally picked the wrong one.
   useEffect(() => {
+    const lastOtherSenderId = [...messages].reverse().find((m) => m.senderId !== myId)?.senderId;
+    if (!lastOtherSenderId) return;
     supabase
       .from("profiles")
       .select("*")
-      .neq("id", myId)
-      .limit(1)
-      .then(({ data }) => data && data[0] && setFriendProfile(data[0]));
-  }, [myId]);
+      .eq("id", lastOtherSenderId)
+      .single()
+      .then(({ data }) => data && setFriendProfile(data));
+  }, [messages, myId]);
 
   // realtime: messages INSERT / UPDATE / DELETE
   useEffect(() => {
