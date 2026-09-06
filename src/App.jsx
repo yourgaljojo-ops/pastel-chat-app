@@ -1281,7 +1281,7 @@ function ChatApp({ session, profile, setProfile }) {
         <div style={{ height: 1, background: HEADER_PINK, opacity: 0.6 }} />
 
         <div style={{ textAlign: "center" }}>
-          {notifStatus === "subscribed" || notifStatus === "granted" ? (
+          {notifStatus === "subscribed" ? (
             <div style={{ fontSize: 12, color: TEXT_SOFT }}>🔔 Notifications are on</div>
           ) : notifStatus === "needs-install" ? (
             <div style={{ fontSize: 11.5, color: TEXT_SOFT, lineHeight: 1.5 }}>
@@ -1293,7 +1293,7 @@ function ChatApp({ session, profile, setProfile }) {
             <div style={{ fontSize: 11.5, color: TEXT_SOFT }}>
               This browser doesn't support notifications
             </div>
-          ) : notifStatus === "default" ? (
+          ) : notifStatus === "default" || notifStatus === "granted" ? (
             <button
               onClick={enableNotifications}
               className="pc-icon-btn"
