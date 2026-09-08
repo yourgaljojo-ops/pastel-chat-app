@@ -25,7 +25,7 @@ import { supabase } from "./supabaseClient";
 /*            "room_participants"                                     */
 /*  Message { id, text, senderName, timestamp, roomId,                 */
 /*            imageUrl?, videoUrl?, audioUrl?,                        */
-/*            read, edited, reactions[] } -> "messages"               */
+/*            read, delivered, edited, reactions[] } -> "messages"    */
 /* ------------------------------------------------------------------ */
 
 const ROSE_GOLD = "#B76E79";
@@ -69,6 +69,7 @@ const rowToMessage = (row) => ({
   videoUrl: row.video_url || undefined,
   audioUrl: row.audio_url || undefined,
   read: row.read,
+  delivered: row.delivered,
   edited: !!row.edited,
   reactions: row.reactions || [],
   replyToId: row.reply_to_id || undefined,
@@ -772,12 +773,22 @@ function ChatApp({ session, profile, setProfile }) {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages, othersTyping]);
 
+  // mark incoming messages as delivered as soon as my client has them —
+  // this fires immediately (no delay), independent of "read", so the
+  // sender's ticks can progress sent -> delivered even before I've
+  // actually looked at the message.
+  useEffect(() => {
+    const undelivered = messages.filter((m) => m.senderId !== myId && !m.delivered);
+    if (undelivered.length === 0) return;
+    undelivered.forEach((m) => supabase.from("messages").update({ delivered: true }).eq("id", m.id));
+  }, [messages, myId]);
+
   // mark incoming unread messages as read once they're on screen
   useEffect(() => {
     const unread = messages.filter((m) => m.senderId !== myId && !m.read);
     if (unread.length === 0) return;
     const t = setTimeout(() => {
-      unread.forEach((m) => supabase.from("messages").update({ read: true }).eq("id", m.id));
+      unread.forEach((m) => supabase.from("messages").update({ read: true, delivered: true }).eq("id", m.id));
     }, 1000);
     return () => clearTimeout(t);
   }, [messages, myId]);
@@ -2065,7 +2076,14 @@ function MessageBubble({
               <span style={{ fontSize: 10, color: TEXT_SOFT, fontStyle: "italic" }}>edited</span>
             )}
             <span style={{ fontSize: 10.5, color: TEXT_SOFT }}>{fmtTime(message.timestamp)}</span>
-            {mine && (message.read ? <CheckCheck size={13} color={READ_PINK} /> : <Check size={13} color="#C9B7BD" />)}
+            {mine &&
+              (message.read ? (
+                <CheckCheck size={13} color={READ_PINK} />
+              ) : message.delivered ? (
+                <CheckCheck size={13} color="#C9B7BD" />
+              ) : (
+                <Check size={13} color="#C9B7BD" />
+              ))}
           </div>
         </div>
 
