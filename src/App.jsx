@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import {
   Send,
   Paperclip,
@@ -12,14 +12,18 @@ import {
   Pencil,
   Trash2,
   Reply,
+  Plus,
+  Users,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
 /* ------------------------------------------------------------------ */
-/*  DATA MODEL (mirrors supabase/schema.sql + migration-2)            */
+/*  DATA MODEL (mirrors the rooms/room_participants migration)        */
 /*                                                                     */
 /*  User    { id, nickname, avatarUrl }             -> "profiles"     */
-/*  Message { id, text, senderName, timestamp,                        */
+/*  Room    { id, name, isGroup, otherParticipants[] } -> "rooms" +    */
+/*            "room_participants"                                     */
+/*  Message { id, text, senderName, timestamp, roomId,                 */
 /*            imageUrl?, videoUrl?, audioUrl?,                        */
 /*            read, edited, reactions[] } -> "messages"               */
 /* ------------------------------------------------------------------ */
@@ -59,6 +63,7 @@ const rowToMessage = (row) => ({
   text: row.text || "",
   senderName: row.sender_name,
   senderId: row.sender_id,
+  roomId: row.room_id,
   timestamp: row.created_at,
   imageUrl: row.image_url || undefined,
   videoUrl: row.video_url || undefined,
@@ -69,6 +74,20 @@ const rowToMessage = (row) => ({
   replyToId: row.reply_to_id || undefined,
   replyToText: row.reply_to_text || undefined,
   replyToSender: row.reply_to_sender || undefined,
+});
+
+// Shapes a `rooms` row (fetched with a nested room_participants->profiles
+// select) into { id, name, isGroup, otherParticipants[] } — "other" meaning
+// everyone in the room except me, which is all the UI ever needs per-room.
+const rowToRoom = (row, myId) => ({
+  id: row.id,
+  name: row.name,
+  isGroup: row.is_group,
+  createdBy: row.created_by,
+  createdAt: row.created_at,
+  otherParticipants: (row.room_participants || [])
+    .map((rp) => rp.profiles)
+    .filter((p) => p && p.id !== myId),
 });
 
 export default function App() {
@@ -479,19 +498,44 @@ const chatStyles = `
   .pc-drawer-backdrop { animation: pcFadeIn .2s ease; }
   @keyframes pcFadeIn { from { opacity: 0; } to { opacity: 1; } }
   .pc-drawer { transition: transform .28s cubic-bezier(.32,.72,0,1); }
+  .pc-room-btn { transition: background .15s ease; }
+  .pc-modal-backdrop { animation: pcFadeIn .18s ease; }
+
+  /* ---- Chromebook / desktop browser: dock the sidebar permanently ---- */
+  @media (min-width: 860px) {
+    .pc-app-shell { flex-direction: row !important; }
+    .pc-drawer {
+      position: static !important;
+      transform: none !important;
+      box-shadow: none !important;
+      width: 320px !important;
+      max-width: 320px !important;
+      min-width: 320px !important;
+      height: 100% !important;
+      order: -1;
+      border-right: 1px solid ${HEADER_PINK};
+    }
+    .pc-drawer-backdrop { display: none !important; }
+    .pc-menu-btn { display: none !important; }
+    .pc-drawer-close { display: none !important; }
+    .pc-main { min-width: 0; }
+  }
 `;
 
 function ChatApp({ session, profile, setProfile }) {
+  const [rooms, setRooms] = useState([]);
+  const [activeRoomId, setActiveRoomId] = useState(null);
+  const [newChatOpen, setNewChatOpen] = useState(false);
+
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
-  const [friendTyping, setFriendTyping] = useState(false);
+  const [othersTyping, setOthersTyping] = useState(false);
   const [openMenuFor, setOpenMenuFor] = useState(null);
   const [recording, setRecording] = useState(false);
   const [toast, setToast] = useState("");
-  const [friendProfile, setFriendProfile] = useState(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [editingMessage, setEditingMessage] = useState(null); // { id, text } | null
-  const [friendOnline, setFriendOnline] = useState(false);
+  const [othersOnline, setOthersOnline] = useState(false);
   const [notifStatus, setNotifStatus] = useState("checking"); // checking | unsupported | needs-install | default | granted | subscribed
   const [replyingTo, setReplyingTo] = useState(null); // { id, text, senderName } | null
 
@@ -508,6 +552,19 @@ function ChatApp({ session, profile, setProfile }) {
     setToast(t);
     setTimeout(() => setToast(""), 2200);
   };
+
+  const activeRoom = rooms.find((r) => r.id === activeRoomId) || null;
+
+  // Quick id -> profile lookup for whoever's in the current room (me +
+  // everyone else), so message bubbles and the header can resolve a
+  // sender's name/avatar without any "guess who the friend is" logic.
+  const participantsById = useMemo(() => {
+    const map = { [myId]: profile };
+    (activeRoom?.otherParticipants || []).forEach((p) => {
+      map[p.id] = p;
+    });
+    return map;
+  }, [activeRoom, profile, myId]);
 
   // Check where things stand for push notifications, without prompting —
   // the actual permission request only happens on an explicit tap (both
@@ -569,47 +626,82 @@ function ChatApp({ session, profile, setProfile }) {
     }
   };
 
-  // initial message load
+  // ---- Rooms: load every room I belong to, with the other participants'
+  // profiles nested in, via room_participants. ----
+  const loadRooms = useCallback(async () => {
+    const { data: participantRows, error: partErr } = await supabase
+      .from("room_participants")
+      .select("room_id")
+      .eq("user_id", myId);
+    if (partErr) return showToast("Couldn't load your chats");
+
+    const roomIds = (participantRows || []).map((r) => r.room_id);
+    if (roomIds.length === 0) {
+      setRooms([]);
+      return;
+    }
+
+    const { data: roomRows, error: roomErr } = await supabase
+      .from("rooms")
+      .select("*, room_participants(user_id, profiles(id, nickname, avatar_url))")
+      .in("id", roomIds)
+      .order("created_at", { ascending: false });
+    if (roomErr) return showToast("Couldn't load your chats");
+
+    const shaped = (roomRows || []).map((r) => rowToRoom(r, myId));
+    setRooms(shaped);
+    setActiveRoomId((prev) => prev || shaped[0]?.id || null);
+  }, [myId]);
+
   useEffect(() => {
+    loadRooms();
+  }, [loadRooms]);
+
+  // If someone adds me to a new room while I'm connected, pick it up live.
+  useEffect(() => {
+    const channel = supabase
+      .channel(`my-rooms-${myId}`)
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "room_participants", filter: `user_id=eq.${myId}` },
+        () => loadRooms()
+      )
+      .subscribe();
+    return () => supabase.removeChannel(channel);
+  }, [myId, loadRooms]);
+
+  // ---- Messages: scoped to whichever room is active ----
+  useEffect(() => {
+    if (!activeRoomId) {
+      setMessages([]);
+      return;
+    }
     supabase
       .from("messages")
       .select("*")
+      .eq("room_id", activeRoomId)
       .order("created_at", { ascending: true })
       .then(({ data, error }) => {
         if (error) return showToast("Couldn't load messages");
         setMessages((data || []).map(rowToMessage));
       });
-  }, []);
+  }, [activeRoomId]);
 
-  // Identify the friend as "whoever actually sent me a message" instead
-  // of an arbitrary other row in profiles — leftover test accounts from
-  // earlier debugging (miss.cherryie, lamanna, testbot, etc.) made "any
-  // other row" ambiguous and occasionally picked the wrong one.
+  // realtime: messages INSERT / UPDATE / DELETE, scoped to the active room
   useEffect(() => {
-    const lastOtherSenderId = [...messages].reverse().find((m) => m.senderId !== myId)?.senderId;
-    if (!lastOtherSenderId) return;
-    supabase
-      .from("profiles")
-      .select("*")
-      .eq("id", lastOtherSenderId)
-      .single()
-      .then(({ data }) => data && setFriendProfile(data));
-  }, [messages, myId]);
-
-  // realtime: messages INSERT / UPDATE / DELETE
-  useEffect(() => {
+    if (!activeRoomId) return;
     const channel = supabase
-      .channel("messages-changes")
+      .channel(`messages-room-${activeRoomId}`)
       .on(
         "postgres_changes",
-        { event: "INSERT", schema: "public", table: "messages" },
+        { event: "INSERT", schema: "public", table: "messages", filter: `room_id=eq.${activeRoomId}` },
         (payload) => {
           setMessages((prev) => [...prev, rowToMessage(payload.new)]);
         }
       )
       .on(
         "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "messages" },
+        { event: "UPDATE", schema: "public", table: "messages", filter: `room_id=eq.${activeRoomId}` },
         (payload) => {
           setMessages((prev) =>
             prev.map((m) => (m.id === payload.new.id ? rowToMessage(payload.new) : m))
@@ -618,7 +710,7 @@ function ChatApp({ session, profile, setProfile }) {
       )
       .on(
         "postgres_changes",
-        { event: "DELETE", schema: "public", table: "messages" },
+        { event: "DELETE", schema: "public", table: "messages", filter: `room_id=eq.${activeRoomId}` },
         (payload) => {
           // Stealth unsend: the row is gone from the DB, so it just
           // vanishes from the UI — no "this message was deleted" trace.
@@ -627,24 +719,25 @@ function ChatApp({ session, profile, setProfile }) {
       )
       .subscribe();
     return () => supabase.removeChannel(channel);
-  }, []);
+  }, [activeRoomId]);
 
-  // realtime: typing broadcast (ephemeral, not stored in the DB)
+  // realtime: typing broadcast (ephemeral, not stored in the DB), per room
   useEffect(() => {
-    const channel = supabase.channel("typing-presence", {
+    if (!activeRoomId) return;
+    const channel = supabase.channel(`typing-presence-${activeRoomId}`, {
       config: { broadcast: { self: false } },
     });
     channel
       .on("broadcast", { event: "typing" }, ({ payload }) => {
         if (payload.userId === myId) return;
-        setFriendTyping(true);
+        setOthersTyping(true);
         clearTimeout(typingStopTimer.current);
-        typingStopTimer.current = setTimeout(() => setFriendTyping(false), 2000);
+        typingStopTimer.current = setTimeout(() => setOthersTyping(false), 2000);
       })
       .subscribe();
     typingChannelRef.current = channel;
     return () => supabase.removeChannel(channel);
-  }, [myId]);
+  }, [myId, activeRoomId]);
 
   const broadcastTyping = useCallback(() => {
     typingChannelRef.current?.send({
@@ -654,15 +747,18 @@ function ChatApp({ session, profile, setProfile }) {
     });
   }, [myId]);
 
-  // real online/offline presence — replaces the old hardcoded "online" label
+  // real online/offline presence, per room — replaces the old hardcoded
+  // "online" label. For groups this just means "at least one other
+  // member is here right now", same simple signal as the 1:1 case.
   useEffect(() => {
-    const channel = supabase.channel("presence-room", {
+    if (!activeRoomId) return;
+    const channel = supabase.channel(`presence-room-${activeRoomId}`, {
       config: { presence: { key: myId } },
     });
     channel.on("presence", { event: "sync" }, () => {
       const state = channel.presenceState();
       const someoneElseOnline = Object.keys(state).some((key) => key !== myId);
-      setFriendOnline(someoneElseOnline);
+      setOthersOnline(someoneElseOnline);
     });
     channel.subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
@@ -670,11 +766,11 @@ function ChatApp({ session, profile, setProfile }) {
       }
     });
     return () => supabase.removeChannel(channel);
-  }, [myId]);
+  }, [myId, activeRoomId]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages, friendTyping]);
+  }, [messages, othersTyping]);
 
   // mark incoming unread messages as read once they're on screen
   useEffect(() => {
@@ -687,11 +783,13 @@ function ChatApp({ session, profile, setProfile }) {
   }, [messages, myId]);
 
   const insertMessage = async (fields = {}) => {
+    if (!activeRoomId) return;
     const textToSend = draft.trim();
     const { error } = await supabase.from("messages").insert({
       text: textToSend,
       sender_id: myId,
       sender_name: profile.nickname,
+      room_id: activeRoomId,
       read: false,
       reactions: [],
       ...(replyingTo
@@ -714,10 +812,11 @@ function ChatApp({ session, profile, setProfile }) {
   };
 
   const startReply = (message) => {
+    const senderProfile = participantsById[message.senderId];
     setReplyingTo({
       id: message.id,
       text: message.imageUrl ? "📷 Photo" : message.videoUrl ? "🎬 Video" : message.audioUrl ? "🎤 Voice note" : message.text,
-      senderName: message.senderId === myId ? profile.nickname : friendProfile?.nickname || message.senderName,
+      senderName: message.senderId === myId ? profile.nickname : senderProfile?.nickname || message.senderName,
     });
     setEditingMessage(null);
     setOpenMenuFor(null);
@@ -898,6 +997,45 @@ function ChatApp({ session, profile, setProfile }) {
     setOpenMenuFor(null);
   };
 
+  // ---- Room creation ----
+  const createRoom = async (participantIds, name) => {
+    const isGroupChat = participantIds.length > 1;
+
+    // For 1:1s, reuse an existing room with that exact person instead of
+    // spawning a duplicate every time someone taps "new chat".
+    if (!isGroupChat) {
+      const existing = rooms.find(
+        (r) => !r.isGroup && r.otherParticipants.length === 1 && r.otherParticipants[0].id === participantIds[0]
+      );
+      if (existing) {
+        setActiveRoomId(existing.id);
+        setNewChatOpen(false);
+        return;
+      }
+    }
+
+    const { data: room, error } = await supabase
+      .from("rooms")
+      .insert({ name: isGroupChat ? name || null : null, is_group: isGroupChat, created_by: myId })
+      .select()
+      .single();
+    if (error || !room) {
+      showToast("Couldn't create chat");
+      return;
+    }
+
+    const rows = [myId, ...participantIds].map((uid) => ({ room_id: room.id, user_id: uid }));
+    const { error: partErr } = await supabase.from("room_participants").insert(rows);
+    if (partErr) {
+      showToast("Couldn't add everyone to the chat");
+      return;
+    }
+
+    await loadRooms();
+    setActiveRoomId(room.id);
+    setNewChatOpen(false);
+  };
+
   // Group messages under day separators ("Today", "Yesterday", ...)
   const groupedMessages = [];
   let lastDay = null;
@@ -910,8 +1048,27 @@ function ChatApp({ session, profile, setProfile }) {
     groupedMessages.push({ type: "message", message: m, key: m.id });
   }
 
+  // ---- Header display info: 1:1 shows the friend; a group shows its
+  // name (or the member list) and a generic avatar. ----
+  const headerName = !activeRoom
+    ? "our little chat"
+    : activeRoom.isGroup
+    ? activeRoom.name || activeRoom.otherParticipants.map((p) => p.nickname).join(", ") || "Group chat"
+    : activeRoom.otherParticipants[0]?.nickname || "Waiting for your friend…";
+  const headerSubtitle = !activeRoom
+    ? ""
+    : othersTyping
+    ? "typing…"
+    : activeRoom.isGroup
+    ? `${activeRoom.otherParticipants.length + 1} members`
+    : othersOnline
+    ? "online"
+    : "offline";
+  const headerAvatarUrl = activeRoom && !activeRoom.isGroup ? activeRoom.otherParticipants[0]?.avatar_url : undefined;
+
   return (
     <div
+      className="pc-app-shell"
       style={{
         position: "fixed",
         inset: 0,
@@ -924,279 +1081,7 @@ function ChatApp({ session, profile, setProfile }) {
     >
       <style>{chatStyles}</style>
 
-      {/* ---------------- HEADER (safe-area aware) ---------------- */}
-      <div
-        style={{
-          background: HEADER_PINK,
-          padding: "12px 16px",
-          paddingTop: "calc(12px + env(safe-area-inset-top, 0px))",
-          paddingLeft: "calc(16px + env(safe-area-inset-left, 0px))",
-          paddingRight: "calc(16px + env(safe-area-inset-right, 0px))",
-          display: "flex",
-          alignItems: "center",
-          gap: 12,
-          borderBottom: `1px solid ${ROSE_GOLD}33`,
-          flexShrink: 0,
-        }}
-      >
-        <button
-          onClick={() => setDrawerOpen(true)}
-          aria-label="Open profile menu"
-          className="pc-icon-btn"
-          style={{
-            width: 40,
-            height: 40,
-            borderRadius: "50%",
-            border: "none",
-            background: "rgba(255,255,255,0.5)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            cursor: "pointer",
-            flexShrink: 0,
-          }}
-        >
-          <Menu size={19} color="#6B2F44" />
-        </button>
-
-        <Avatar url={friendProfile?.avatar_url} name={friendProfile?.nickname || "?"} size={38} ring />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: 700, color: "#6B2F44", fontSize: 15, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-            {friendProfile?.nickname || "Waiting for your friend…"}
-          </div>
-          <div style={{ fontSize: 11, color: "#8A4A5D" }}>
-            {friendTyping ? "typing…" : friendOnline ? "online" : "offline"}
-          </div>
-        </div>
-      </div>
-
-      {/* ---------------- MESSAGES ---------------- */}
-      <div
-        ref={scrollRef}
-        className="pc-scroll"
-        style={{
-          flex: 1,
-          overflowY: "auto",
-          padding: "16px",
-          paddingLeft: "calc(16px + env(safe-area-inset-left, 0px))",
-          paddingRight: "calc(16px + env(safe-area-inset-right, 0px))",
-          display: "flex",
-          flexDirection: "column",
-          gap: 8,
-        }}
-      >
-        {groupedMessages.map((item) =>
-          item.type === "separator" ? (
-            <div
-              key={item.key}
-              style={{
-                textAlign: "center",
-                fontSize: 11,
-                color: TEXT_SOFT,
-                margin: "10px 0 4px",
-                fontWeight: 600,
-                letterSpacing: 0.3,
-              }}
-            >
-              {item.label}
-            </div>
-          ) : (
-            <MessageBubble
-              key={item.key}
-              message={item.message}
-              mine={item.message.senderId === myId}
-              displayName={item.message.senderId === myId ? profile.nickname : friendProfile?.nickname || item.message.senderName}
-              avatarUrl={item.message.senderId === myId ? profile.avatar_url : friendProfile?.avatar_url}
-              isOpen={openMenuFor === item.message.id}
-              onToggleMenu={() =>
-                setOpenMenuFor(openMenuFor === item.message.id ? null : item.message.id)
-              }
-              onReact={(emoji) => addReaction(item.message, emoji)}
-              onEdit={() => startEdit(item.message)}
-              onUnsend={() => unsendMessage(item.message)}
-              onReply={() => startReply(item.message)}
-              onJumpToQuoted={() => item.message.replyToId && jumpToMessage(item.message.replyToId)}
-            />
-          )
-        )}
-
-        {friendTyping && (
-          <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
-            <Avatar url={friendProfile?.avatar_url} name={friendProfile?.nickname || "?"} size={24} />
-            <div
-              className="pc-bubble-in"
-              style={{
-                background: BUBBLE_WHITE,
-                borderRadius: "18px 18px 18px 4px",
-                padding: "12px 16px",
-                display: "flex",
-                gap: 4,
-                boxShadow: "0 2px 10px rgba(183,110,121,0.12)",
-              }}
-            >
-              {[0, 1, 2].map((i) => (
-                <span
-                  key={i}
-                  className="pc-dot"
-                  style={{
-                    width: 6,
-                    height: 6,
-                    borderRadius: "50%",
-                    background: ROSE_GOLD,
-                    display: "inline-block",
-                    animationDelay: `${i * 0.15}s`,
-                  }}
-                />
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* ---------------- COMPOSER (safe-area aware) ---------------- */}
-      <div
-        style={{
-          background: "#FFE9F0",
-          borderTop: `1px solid ${HEADER_PINK}`,
-          flexShrink: 0,
-          paddingBottom: "env(safe-area-inset-bottom, 0px)",
-        }}
-      >
-        {editingMessage && (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              padding: "8px 16px 0",
-              fontSize: 12,
-              color: ROSE_GOLD,
-            }}
-          >
-            <Pencil size={12} />
-            <span style={{ flex: 1 }}>Editing message</span>
-            <button
-              onClick={cancelEdit}
-              style={{ border: "none", background: "transparent", color: TEXT_SOFT, cursor: "pointer" }}
-            >
-              <X size={14} />
-            </button>
-          </div>
-        )}
-        {replyingTo && (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              padding: "8px 16px 0",
-            }}
-          >
-            <div
-              style={{
-                flex: 1,
-                background: "#fff",
-                borderLeft: `3px solid ${ROSE_GOLD}`,
-                borderRadius: 8,
-                padding: "6px 10px",
-                minWidth: 0,
-              }}
-            >
-              <div style={{ fontSize: 11, fontWeight: 700, color: ROSE_GOLD }}>
-                Replying to {replyingTo.senderName}
-              </div>
-              <div
-                style={{
-                  fontSize: 12,
-                  color: TEXT_SOFT,
-                  whiteSpace: "nowrap",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                }}
-              >
-                {replyingTo.text}
-              </div>
-            </div>
-            <button
-              onClick={cancelReply}
-              style={{ border: "none", background: "transparent", color: TEXT_SOFT, cursor: "pointer" }}
-            >
-              <X size={16} />
-            </button>
-          </div>
-        )}
-        <div
-          style={{
-            padding: "10px 16px",
-            paddingLeft: "calc(16px + env(safe-area-inset-left, 0px))",
-            paddingRight: "calc(16px + env(safe-area-inset-right, 0px))",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-          }}
-        >
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*,video/*,audio/*"
-            style={{ display: "none" }}
-            onChange={handleFilePick}
-          />
-          <IconButton label="Attach photo, video, or audio" onClick={() => fileInputRef.current?.click()}>
-            <Paperclip size={19} color={ROSE_GOLD} />
-          </IconButton>
-          <IconButton
-            label={recording ? "Stop recording" : "Record voice note"}
-            onClick={toggleRecording}
-            active={recording}
-          >
-            {recording ? <Square size={17} color="#fff" fill="#fff" /> : <Mic size={19} color={ROSE_GOLD} />}
-          </IconButton>
-          <input
-            ref={composerRef}
-            value={draft}
-            onChange={(e) => {
-              setDraft(e.target.value);
-              broadcastTyping();
-            }}
-            onKeyDown={handleKeyDown}
-            placeholder={editingMessage ? "Edit your message…" : "Say something sweet…"}
-            style={{
-              flex: 1,
-              minWidth: 0,
-              border: `1px solid ${HEADER_PINK}`,
-              borderRadius: 999,
-              padding: "11px 18px",
-              fontSize: 16,
-              outline: "none",
-              background: "#fff",
-              color: TEXT_DEEP,
-              fontFamily: "inherit",
-            }}
-          />
-          <button
-            onClick={handleComposerSubmit}
-            className="pc-icon-btn"
-            aria-label={editingMessage ? "Save edit" : "Send message"}
-            style={{
-              width: 40,
-              height: 40,
-              borderRadius: "50%",
-              border: "none",
-              background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              cursor: "pointer",
-              flexShrink: 0,
-            }}
-          >
-            {editingMessage ? <Check size={17} color="#fff" /> : <Send size={17} color="#fff" />}
-          </button>
-        </div>
-      </div>
-
-      {/* ---------------- PROFILE DRAWER ---------------- */}
+      {/* ---------------- LEFT PANEL: rooms + profile ---------------- */}
       {drawerOpen && (
         <div
           className="pc-drawer-backdrop"
@@ -1216,28 +1101,28 @@ function ChatApp({ session, profile, setProfile }) {
           top: 0,
           bottom: 0,
           left: 0,
-          width: "78%",
-          maxWidth: 300,
+          width: "82%",
+          maxWidth: 320,
           background: "linear-gradient(180deg, #FFE4EC 0%, #FFF0F5 100%)",
           zIndex: 21,
           transform: drawerOpen ? "translateX(0)" : "translateX(-105%)",
           boxShadow: drawerOpen ? "8px 0 30px rgba(183,110,121,0.25)" : "none",
-          padding: "24px 18px",
-          paddingTop: "calc(24px + env(safe-area-inset-top, 0px))",
-          paddingBottom: "calc(24px + env(safe-area-inset-bottom, 0px))",
-          paddingLeft: "calc(18px + env(safe-area-inset-left, 0px))",
+          padding: "20px 16px",
+          paddingTop: "calc(20px + env(safe-area-inset-top, 0px))",
+          paddingBottom: "calc(20px + env(safe-area-inset-bottom, 0px))",
+          paddingLeft: "calc(16px + env(safe-area-inset-left, 0px))",
           display: "flex",
           flexDirection: "column",
-          gap: 26,
-          overflowY: "auto",
+          gap: 16,
+          overflow: "hidden",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
           <div
             style={{
               fontFamily: "'Cormorant Garamond',serif",
               fontStyle: "italic",
-              fontSize: 22,
+              fontSize: 21,
               fontWeight: 600,
               color: ROSE_GOLD,
             }}
@@ -1245,6 +1130,7 @@ function ChatApp({ session, profile, setProfile }) {
             our little chat
           </div>
           <button
+            className="pc-drawer-close"
             onClick={() => setDrawerOpen(false)}
             aria-label="Close menu"
             style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_SOFT }}
@@ -1268,19 +1154,112 @@ function ChatApp({ session, profile, setProfile }) {
           onChange={handleAvatarUpload}
         />
 
-        <div style={{ height: 1, background: HEADER_PINK, opacity: 0.6 }} />
+        <div style={{ height: 1, background: HEADER_PINK, opacity: 0.6, flexShrink: 0 }} />
 
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
-          <div style={{ fontSize: 11, color: TEXT_SOFT }}>Friend</div>
-          <Avatar url={friendProfile?.avatar_url} name={friendProfile?.nickname || "?"} size={64} ring />
-          <div style={{ fontSize: 14, fontWeight: 600, color: TEXT_DEEP }}>
-            {friendProfile?.nickname || "waiting to join…"}
-          </div>
+        <button
+          onClick={() => setNewChatOpen(true)}
+          className="pc-icon-btn"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 8,
+            border: "none",
+            borderRadius: 999,
+            padding: "10px 0",
+            background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+            color: "#fff",
+            fontWeight: 700,
+            fontSize: 13,
+            cursor: "pointer",
+            flexShrink: 0,
+          }}
+        >
+          <Plus size={16} /> New chat
+        </button>
+
+        {/* scrollable room list */}
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
+          {rooms.length === 0 ? (
+            <div style={{ fontSize: 12.5, color: TEXT_SOFT, textAlign: "center", padding: "18px 8px" }}>
+              No chats yet — start one above 💌
+            </div>
+          ) : (
+            rooms.map((room) => {
+              const title = room.isGroup
+                ? room.name || room.otherParticipants.map((p) => p.nickname).join(", ") || "Group chat"
+                : room.otherParticipants[0]?.nickname || "Unnamed";
+              const avatarName = room.isGroup
+                ? room.name || room.otherParticipants.map((p) => p.nickname).join(" ") || "Group"
+                : room.otherParticipants[0]?.nickname || "?";
+              const avatarUrl = room.isGroup ? undefined : room.otherParticipants[0]?.avatar_url;
+              const active = room.id === activeRoomId;
+              return (
+                <button
+                  key={room.id}
+                  className="pc-room-btn"
+                  onClick={() => {
+                    setActiveRoomId(room.id);
+                    setDrawerOpen(false);
+                  }}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    padding: "8px 8px",
+                    borderRadius: 14,
+                    border: "none",
+                    cursor: "pointer",
+                    textAlign: "left",
+                    width: "100%",
+                    background: active ? "rgba(255,255,255,0.75)" : "transparent",
+                  }}
+                >
+                  {room.isGroup ? (
+                    <div
+                      style={{
+                        width: 40,
+                        height: 40,
+                        borderRadius: "50%",
+                        flexShrink: 0,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        background: "linear-gradient(135deg, #FFC1CC, #E8B4BE)",
+                        border: active ? `2px solid ${ROSE_GOLD}` : "none",
+                      }}
+                    >
+                      <Users size={17} color="#fff" />
+                    </div>
+                  ) : (
+                    <Avatar url={avatarUrl} name={avatarName} size={40} ring={active} />
+                  )}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div
+                      style={{
+                        fontSize: 13.5,
+                        fontWeight: 700,
+                        color: TEXT_DEEP,
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}
+                    >
+                      {title}
+                    </div>
+                    {room.isGroup && (
+                      <div style={{ fontSize: 11, color: TEXT_SOFT }}>{room.otherParticipants.length + 1} members</div>
+                    )}
+                  </div>
+                </button>
+              );
+            })
+          )}
         </div>
 
-        <div style={{ height: 1, background: HEADER_PINK, opacity: 0.6 }} />
+        <div style={{ height: 1, background: HEADER_PINK, opacity: 0.6, flexShrink: 0 }} />
 
-        <div style={{ textAlign: "center" }}>
+        <div style={{ textAlign: "center", flexShrink: 0 }}>
           {notifStatus === "subscribed" ? (
             <div style={{ fontSize: 12, color: TEXT_SOFT }}>🔔 Notifications are on</div>
           ) : notifStatus === "needs-install" ? (
@@ -1313,7 +1292,7 @@ function ChatApp({ session, profile, setProfile }) {
           ) : null}
         </div>
 
-        <div style={{ marginTop: "auto", textAlign: "center" }}>
+        <div style={{ textAlign: "center", flexShrink: 0 }}>
           <button
             onClick={() => supabase.auth.signOut()}
             style={{ border: "none", background: "none", color: TEXT_SOFT, cursor: "pointer", fontSize: 13 }}
@@ -1321,6 +1300,352 @@ function ChatApp({ session, profile, setProfile }) {
             Sign out
           </button>
         </div>
+      </div>
+
+      {newChatOpen && (
+        <NewChatModal myId={myId} onClose={() => setNewChatOpen(false)} onCreate={createRoom} />
+      )}
+
+      {/* ---------------- MAIN: header + messages + composer ---------------- */}
+      <div className="pc-main" style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden" }}>
+        {/* ---------------- HEADER (safe-area aware) ---------------- */}
+        <div
+          style={{
+            background: HEADER_PINK,
+            padding: "12px 16px",
+            paddingTop: "calc(12px + env(safe-area-inset-top, 0px))",
+            paddingLeft: "calc(16px + env(safe-area-inset-left, 0px))",
+            paddingRight: "calc(16px + env(safe-area-inset-right, 0px))",
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            borderBottom: `1px solid ${ROSE_GOLD}33`,
+            flexShrink: 0,
+          }}
+        >
+          <button
+            onClick={() => setDrawerOpen(true)}
+            aria-label="Open menu"
+            className="pc-icon-btn pc-menu-btn"
+            style={{
+              width: 40,
+              height: 40,
+              borderRadius: "50%",
+              border: "none",
+              background: "rgba(255,255,255,0.5)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              flexShrink: 0,
+            }}
+          >
+            <Menu size={19} color="#6B2F44" />
+          </button>
+
+          {activeRoom?.isGroup ? (
+            <div
+              style={{
+                width: 38,
+                height: 38,
+                borderRadius: "50%",
+                flexShrink: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: "linear-gradient(135deg, #FFC1CC, #E8B4BE)",
+              }}
+            >
+              <Users size={16} color="#fff" />
+            </div>
+          ) : (
+            <Avatar url={headerAvatarUrl} name={headerName} size={38} ring />
+          )}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 700, color: "#6B2F44", fontSize: 15, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {headerName}
+            </div>
+            <div style={{ fontSize: 11, color: "#8A4A5D" }}>{headerSubtitle}</div>
+          </div>
+        </div>
+
+        {!activeRoom ? (
+          <div
+            style={{
+              flex: 1,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 14,
+              padding: 24,
+              textAlign: "center",
+            }}
+          >
+            <div style={{ fontFamily: "'Cormorant Garamond',serif", fontStyle: "italic", fontSize: 22, color: ROSE_GOLD }}>
+              no chats yet
+            </div>
+            <div style={{ fontSize: 13, color: TEXT_SOFT, maxWidth: 240 }}>
+              Start a new chat with a friend to get things going 💌
+            </div>
+            <button
+              onClick={() => setNewChatOpen(true)}
+              className="pc-icon-btn"
+              style={{
+                border: "none",
+                borderRadius: 999,
+                padding: "10px 20px",
+                background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+                color: "#fff",
+                fontWeight: 700,
+                fontSize: 13,
+                cursor: "pointer",
+              }}
+            >
+              <Plus size={14} style={{ marginRight: 6, verticalAlign: -2 }} /> New chat
+            </button>
+          </div>
+        ) : (
+          <>
+            {/* ---------------- MESSAGES ---------------- */}
+            <div
+              ref={scrollRef}
+              className="pc-scroll"
+              style={{
+                flex: 1,
+                overflowY: "auto",
+                padding: "16px",
+                paddingLeft: "calc(16px + env(safe-area-inset-left, 0px))",
+                paddingRight: "calc(16px + env(safe-area-inset-right, 0px))",
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+              }}
+            >
+              {groupedMessages.map((item) =>
+                item.type === "separator" ? (
+                  <div
+                    key={item.key}
+                    style={{
+                      textAlign: "center",
+                      fontSize: 11,
+                      color: TEXT_SOFT,
+                      margin: "10px 0 4px",
+                      fontWeight: 600,
+                      letterSpacing: 0.3,
+                    }}
+                  >
+                    {item.label}
+                  </div>
+                ) : (
+                  <MessageBubble
+                    key={item.key}
+                    message={item.message}
+                    mine={item.message.senderId === myId}
+                    displayName={
+                      item.message.senderId === myId
+                        ? profile.nickname
+                        : participantsById[item.message.senderId]?.nickname || item.message.senderName
+                    }
+                    avatarUrl={
+                      item.message.senderId === myId
+                        ? profile.avatar_url
+                        : participantsById[item.message.senderId]?.avatar_url
+                    }
+                    isOpen={openMenuFor === item.message.id}
+                    onToggleMenu={() =>
+                      setOpenMenuFor(openMenuFor === item.message.id ? null : item.message.id)
+                    }
+                    onReact={(emoji) => addReaction(item.message, emoji)}
+                    onEdit={() => startEdit(item.message)}
+                    onUnsend={() => unsendMessage(item.message)}
+                    onReply={() => startReply(item.message)}
+                    onJumpToQuoted={() => item.message.replyToId && jumpToMessage(item.message.replyToId)}
+                  />
+                )
+              )}
+
+              {othersTyping && (
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
+                  <Avatar
+                    url={activeRoom.isGroup ? undefined : activeRoom.otherParticipants[0]?.avatar_url}
+                    name={headerName}
+                    size={24}
+                  />
+                  <div
+                    className="pc-bubble-in"
+                    style={{
+                      background: BUBBLE_WHITE,
+                      borderRadius: "18px 18px 18px 4px",
+                      padding: "12px 16px",
+                      display: "flex",
+                      gap: 4,
+                      boxShadow: "0 2px 10px rgba(183,110,121,0.12)",
+                    }}
+                  >
+                    {[0, 1, 2].map((i) => (
+                      <span
+                        key={i}
+                        className="pc-dot"
+                        style={{
+                          width: 6,
+                          height: 6,
+                          borderRadius: "50%",
+                          background: ROSE_GOLD,
+                          display: "inline-block",
+                          animationDelay: `${i * 0.15}s`,
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* ---------------- COMPOSER (safe-area aware) ---------------- */}
+            <div
+              style={{
+                background: "#FFE9F0",
+                borderTop: `1px solid ${HEADER_PINK}`,
+                flexShrink: 0,
+                paddingBottom: "env(safe-area-inset-bottom, 0px)",
+              }}
+            >
+              {editingMessage && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "8px 16px 0",
+                    fontSize: 12,
+                    color: ROSE_GOLD,
+                  }}
+                >
+                  <Pencil size={12} />
+                  <span style={{ flex: 1 }}>Editing message</span>
+                  <button
+                    onClick={cancelEdit}
+                    style={{ border: "none", background: "transparent", color: TEXT_SOFT, cursor: "pointer" }}
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              )}
+              {replyingTo && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "8px 16px 0",
+                  }}
+                >
+                  <div
+                    style={{
+                      flex: 1,
+                      background: "#fff",
+                      borderLeft: `3px solid ${ROSE_GOLD}`,
+                      borderRadius: 8,
+                      padding: "6px 10px",
+                      minWidth: 0,
+                    }}
+                  >
+                    <div style={{ fontSize: 11, fontWeight: 700, color: ROSE_GOLD }}>
+                      Replying to {replyingTo.senderName}
+                    </div>
+                    <div
+                      style={{
+                        fontSize: 12,
+                        color: TEXT_SOFT,
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}
+                    >
+                      {replyingTo.text}
+                    </div>
+                  </div>
+                  <button
+                    onClick={cancelReply}
+                    style={{ border: "none", background: "transparent", color: TEXT_SOFT, cursor: "pointer" }}
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              )}
+              <div
+                style={{
+                  padding: "10px 16px",
+                  paddingLeft: "calc(16px + env(safe-area-inset-left, 0px))",
+                  paddingRight: "calc(16px + env(safe-area-inset-right, 0px))",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*,video/*,audio/*"
+                  style={{ display: "none" }}
+                  onChange={handleFilePick}
+                />
+                <IconButton label="Attach photo, video, or audio" onClick={() => fileInputRef.current?.click()}>
+                  <Paperclip size={19} color={ROSE_GOLD} />
+                </IconButton>
+                <IconButton
+                  label={recording ? "Stop recording" : "Record voice note"}
+                  onClick={toggleRecording}
+                  active={recording}
+                >
+                  {recording ? <Square size={17} color="#fff" fill="#fff" /> : <Mic size={19} color={ROSE_GOLD} />}
+                </IconButton>
+                <input
+                  ref={composerRef}
+                  value={draft}
+                  onChange={(e) => {
+                    setDraft(e.target.value);
+                    broadcastTyping();
+                  }}
+                  onKeyDown={handleKeyDown}
+                  placeholder={editingMessage ? "Edit your message…" : "Say something sweet…"}
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    border: `1px solid ${HEADER_PINK}`,
+                    borderRadius: 999,
+                    padding: "11px 18px",
+                    fontSize: 16,
+                    outline: "none",
+                    background: "#fff",
+                    color: TEXT_DEEP,
+                    fontFamily: "inherit",
+                  }}
+                />
+                <button
+                  onClick={handleComposerSubmit}
+                  className="pc-icon-btn"
+                  aria-label={editingMessage ? "Save edit" : "Send message"}
+                  style={{
+                    width: 40,
+                    height: 40,
+                    borderRadius: "50%",
+                    border: "none",
+                    background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    cursor: "pointer",
+                    flexShrink: 0,
+                  }}
+                >
+                  {editingMessage ? <Check size={17} color="#fff" /> : <Send size={17} color="#fff" />}
+                </button>
+              </div>
+            </div>
+          </>
+        )}
       </div>
 
       {toast && (
@@ -1345,6 +1670,153 @@ function ChatApp({ session, profile, setProfile }) {
           {toast}
         </div>
       )}
+    </div>
+  );
+}
+
+// Picker for starting a 1:1 or group chat — lists everyone else with a
+// profile, lets you multi-select, and names the room if 3+ are picked.
+function NewChatModal({ myId, onClose, onCreate }) {
+  const [profiles, setProfiles] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState([]);
+  const [groupName, setGroupName] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  useEffect(() => {
+    supabase
+      .from("profiles")
+      .select("id, nickname, avatar_url")
+      .neq("id", myId)
+      .then(({ data }) => {
+        setProfiles(data || []);
+        setLoading(false);
+      });
+  }, [myId]);
+
+  const toggle = (id) => {
+    setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  };
+
+  const isGroup = selected.length > 1;
+
+  const submit = async () => {
+    if (selected.length === 0 || creating) return;
+    setCreating(true);
+    await onCreate(selected, isGroup ? groupName.trim() : "");
+    setCreating(false);
+  };
+
+  return (
+    <div
+      className="pc-modal-backdrop"
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(107,74,87,0.4)",
+        zIndex: 40,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="pc-bubble-in"
+        style={{
+          background: "#fff",
+          borderRadius: 20,
+          padding: 22,
+          width: "100%",
+          maxWidth: 360,
+          maxHeight: "80vh",
+          display: "flex",
+          flexDirection: "column",
+          gap: 14,
+          boxShadow: "0 14px 40px rgba(183,110,121,0.25)",
+          fontFamily: "'Quicksand','Poppins',sans-serif",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ fontFamily: "'Cormorant Garamond',serif", fontStyle: "italic", fontSize: 20, color: ROSE_GOLD }}>
+            New chat
+          </div>
+          <button onClick={onClose} style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_SOFT }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        {isGroup && (
+          <input
+            value={groupName}
+            onChange={(e) => setGroupName(e.target.value)}
+            placeholder="Name this group (optional)"
+            style={{
+              border: `1.5px solid ${HEADER_PINK}`,
+              borderRadius: 999,
+              padding: "9px 14px",
+              fontSize: 13,
+              outline: "none",
+              fontFamily: "inherit",
+              color: TEXT_DEEP,
+            }}
+          />
+        )}
+
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
+          {loading ? (
+            <div style={{ fontSize: 13, color: TEXT_SOFT, textAlign: "center", padding: 20 }}>Loading friends…</div>
+          ) : profiles.length === 0 ? (
+            <div style={{ fontSize: 13, color: TEXT_SOFT, textAlign: "center", padding: 20 }}>
+              No other profiles yet
+            </div>
+          ) : (
+            profiles.map((p) => {
+              const isSelected = selected.includes(p.id);
+              return (
+                <button
+                  key={p.id}
+                  onClick={() => toggle(p.id)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    padding: "8px 8px",
+                    borderRadius: 12,
+                    border: "none",
+                    cursor: "pointer",
+                    textAlign: "left",
+                    background: isSelected ? "#FFE4EC" : "transparent",
+                  }}
+                >
+                  <Avatar url={p.avatar_url} name={p.nickname} size={38} />
+                  <span style={{ flex: 1, fontSize: 14, fontWeight: 600, color: TEXT_DEEP }}>{p.nickname}</span>
+                  {isSelected && <Check size={16} color={ROSE_GOLD} />}
+                </button>
+              );
+            })
+          )}
+        </div>
+
+        <button
+          onClick={submit}
+          disabled={selected.length === 0 || creating}
+          style={{
+            border: "none",
+            borderRadius: 999,
+            padding: "11px 0",
+            background: selected.length === 0 ? "#F0DCE2" : `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+            color: "#fff",
+            fontWeight: 700,
+            fontSize: 14,
+            cursor: selected.length === 0 ? "default" : "pointer",
+          }}
+        >
+          {creating ? "Creating…" : isGroup ? `Start group (${selected.length})` : "Start chat"}
+        </button>
+      </div>
     </div>
   );
 }
