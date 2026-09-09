@@ -1380,6 +1380,34 @@ function ChatApp({ session, profile, setProfile, inviteStatus }) {
     }
   };
 
+  // For the zero-connections dead end: quietly create a placeholder room
+  // (just me, for now) and copy its invite link immediately. Whoever
+  // clicks that link becomes the room's second participant the moment
+  // they join — same mechanism as every other invite link, just created
+  // ahead of time instead of picked from an existing chat.
+  const startInviteOnlyRoom = async () => {
+    const { data: room, error } = await supabase
+      .from("rooms")
+      .insert({ name: null, is_group: false, created_by: myId })
+      .select()
+      .single();
+    if (error || !room) {
+      showToast("Couldn't create invite link");
+      return;
+    }
+    const { error: partErr } = await supabase
+      .from("room_participants")
+      .insert({ room_id: room.id, user_id: myId });
+    if (partErr) {
+      showToast("Couldn't create invite link");
+      return;
+    }
+    await loadRooms();
+    setActiveRoomId(room.id);
+    setNewChatOpen(false);
+    await copyInviteLink(room.id);
+  };
+
   // Group messages under day separators ("Today", "Yesterday", ...)
   const groupedMessages = [];
   let lastDay = null;
@@ -1566,10 +1594,10 @@ function ChatApp({ session, profile, setProfile, inviteStatus }) {
             rooms.map((room) => {
               const title = room.isGroup
                 ? room.name || room.otherParticipants.map((p) => p.nickname).join(", ") || "Group chat"
-                : room.otherParticipants[0]?.nickname || "Unnamed";
+                : room.otherParticipants[0]?.nickname || "Waiting for a friend…";
               const avatarName = room.isGroup
                 ? room.name || room.otherParticipants.map((p) => p.nickname).join(" ") || "Group"
-                : room.otherParticipants[0]?.nickname || "?";
+                : room.otherParticipants[0]?.nickname || "💌";
               const avatarUrl = room.isGroup ? undefined : room.otherParticipants[0]?.avatar_url;
               const active = room.id === activeRoomId;
               return (
@@ -1705,7 +1733,12 @@ function ChatApp({ session, profile, setProfile, inviteStatus }) {
       </div>
 
       {newChatOpen && (
-        <NewChatModal myId={myId} onClose={() => setNewChatOpen(false)} onCreate={createRoom} />
+        <NewChatModal
+          myId={myId}
+          onClose={() => setNewChatOpen(false)}
+          onCreate={createRoom}
+          onGenerateFirstInvite={startInviteOnlyRoom}
+        />
       )}
 
       {/* ---------------- MAIN: header + messages + composer ---------------- */}
@@ -2078,12 +2111,13 @@ function ChatApp({ session, profile, setProfile, inviteStatus }) {
 
 // Picker for starting a 1:1 or group chat — lists everyone else with a
 // profile, lets you multi-select, and names the room if 3+ are picked.
-function NewChatModal({ myId, onClose, onCreate }) {
+function NewChatModal({ myId, onClose, onCreate, onGenerateFirstInvite }) {
   const [profiles, setProfiles] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState([]);
   const [groupName, setGroupName] = useState("");
   const [creating, setCreating] = useState(false);
+  const [generatingInvite, setGeneratingInvite] = useState(false);
 
   useEffect(() => {
     // Deliberately NOT "select all profiles" — that used to work only
@@ -2194,10 +2228,44 @@ function NewChatModal({ myId, onClose, onCreate }) {
           {loading ? (
             <div style={{ fontSize: 13, color: TEXT_SOFT, textAlign: "center", padding: 20 }}>Loading friends…</div>
           ) : profiles.length === 0 ? (
-            <div style={{ fontSize: 13, color: TEXT_SOFT, textAlign: "center", padding: "24px 12px", lineHeight: 1.6 }}>
-              You'll see people here once you're both in a chat together.
-              <br />
-              Use the link icon next to a chat to invite someone new 💌
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                gap: 14,
+                padding: "20px 12px",
+                textAlign: "center",
+              }}
+            >
+              <div style={{ fontSize: 13, color: TEXT_SOFT, lineHeight: 1.6 }}>
+                You don't have anyone to start a chat with yet — send a friend
+                your personal invite link to bring them in 💌
+              </div>
+              <button
+                onClick={async () => {
+                  setGeneratingInvite(true);
+                  await onGenerateFirstInvite();
+                  setGeneratingInvite(false);
+                }}
+                disabled={generatingInvite}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  border: "none",
+                  borderRadius: 999,
+                  padding: "10px 20px",
+                  background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+                  color: "#fff",
+                  fontWeight: 700,
+                  fontSize: 13,
+                  cursor: generatingInvite ? "default" : "pointer",
+                }}
+              >
+                <Link2 size={15} />
+                {generatingInvite ? "Generating…" : "Generate invite link"}
+              </button>
             </div>
           ) : (
             profiles.map((p) => {
@@ -2227,22 +2295,24 @@ function NewChatModal({ myId, onClose, onCreate }) {
           )}
         </div>
 
-        <button
-          onClick={submit}
-          disabled={selected.length === 0 || creating}
-          style={{
-            border: "none",
-            borderRadius: 999,
-            padding: "11px 0",
-            background: selected.length === 0 ? "#F0DCE2" : `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
-            color: "#fff",
-            fontWeight: 700,
-            fontSize: 14,
-            cursor: selected.length === 0 ? "default" : "pointer",
-          }}
-        >
-          {creating ? "Creating…" : isGroup ? `Start group (${selected.length})` : "Start chat"}
-        </button>
+        {profiles.length > 0 && (
+          <button
+            onClick={submit}
+            disabled={selected.length === 0 || creating}
+            style={{
+              border: "none",
+              borderRadius: 999,
+              padding: "11px 0",
+              background: selected.length === 0 ? "#F0DCE2" : `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+              color: "#fff",
+              fontWeight: 700,
+              fontSize: 14,
+              cursor: selected.length === 0 ? "default" : "pointer",
+            }}
+          >
+            {creating ? "Creating…" : isGroup ? `Start group (${selected.length})` : "Start chat"}
+          </button>
+        )}
       </div>
     </div>
   );
