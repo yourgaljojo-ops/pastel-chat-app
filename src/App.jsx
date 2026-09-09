@@ -14,6 +14,8 @@ import {
   Reply,
   Plus,
   Users,
+  Link2,
+  HardDrive,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
@@ -100,6 +102,8 @@ export default function App() {
   const [authError, setAuthError] = useState("");
   const [resendCooldown, setResendCooldown] = useState(0);
   const [verifying, setVerifying] = useState(false);
+  const [capReached, setCapReached] = useState(false);
+  const [inviteStatus, setInviteStatus] = useState(""); // transient toast-ish note about invite-link join
 
   // auth bootstrap — wait for the initial check to actually finish before
   // deciding whether to show the login screen, so a refresh never flashes
@@ -126,11 +130,59 @@ export default function App() {
       .then(({ data }) => data && setProfile(data));
   }, [session]);
 
+  // Invite-link on-ramp: if someone arrives via a shared room link
+  // (?room=<uuid>), drop them into that room the moment they're signed in.
+  // Room UUIDs are unguessable, so knowing one *is* the invite — the same
+  // "anyone with the link" model as a shared Google Doc.
+  useEffect(() => {
+    if (!session) return;
+    const params = new URLSearchParams(window.location.search);
+    const inviteRoomId = params.get("room");
+    if (!inviteRoomId) return;
+
+    supabase
+      .from("room_participants")
+      .insert({ room_id: inviteRoomId, user_id: session.user.id })
+      .then(({ error }) => {
+        // 23505 = already a participant — not an error from the user's
+        // point of view, just means they'd already joined before.
+        if (error && error.code !== "23505") {
+          setInviteStatus("That invite link didn't work — the chat may not exist anymore.");
+        } else {
+          setInviteStatus("Joined the chat! 💌");
+        }
+        // Clean the ?room= param off the URL either way, so a refresh
+        // doesn't re-trigger this and the link doesn't linger visibly.
+        window.history.replaceState({}, "", window.location.pathname);
+        setTimeout(() => setInviteStatus(""), 3000);
+      });
+  }, [session]);
+
   const sendCode = async (e) => {
     e?.preventDefault();
     setAuthError("");
+
+    // Check capacity BEFORE attempting signup, for a friendlier experience
+    // than "try, then fail" — get_capacity_status() is callable even by
+    // signed-out visitors. This only ever blocks genuinely NEW emails;
+    // existing members' rows already exist so this check doesn't affect
+    // them (and the DB-level cap only fires on brand-new auth.users rows).
+    const { data: capacity } = await supabase.rpc("get_capacity_status");
+    if (capacity?.is_full) {
+      setCapReached(true);
+      return;
+    }
+
     const { error } = await supabase.auth.signInWithOtp({ email: authEmail });
     if (error) {
+      // Belt-and-suspenders: if capacity filled between the check above
+      // and this call, the DB trigger itself rejects the new auth.users
+      // row and Supabase surfaces it as a generic "Database error" —
+      // catch that specific case and show the real reason instead.
+      if (/signup_cap_reached|Database error saving new user/i.test(error.message || "")) {
+        setCapReached(true);
+        return;
+      }
       setAuthError(error.message || "Something went wrong sending the code. Try again.");
       return;
     }
@@ -162,6 +214,8 @@ export default function App() {
 
   if (!sessionChecked) return <CenteredNote text="Loading…" />;
 
+  if (capReached) return <CapacityFullScreen />;
+
   if (!session) {
     return (
       <AuthScreen
@@ -184,7 +238,84 @@ export default function App() {
 
   if (!profile) return <CenteredNote text="Loading your profile…" />;
 
-  return <ChatApp session={session} profile={profile} setProfile={setProfile} />;
+  return <ChatApp session={session} profile={profile} setProfile={setProfile} inviteStatus={inviteStatus} />;
+}
+
+// Shown when the 100-account circle is full — a deliberate, friendly wall
+// rather than a confusing error, with a direct way to reach the creator.
+function CapacityFullScreen() {
+  return (
+    <div
+      style={{
+        minHeight: 520,
+        position: "relative",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: `linear-gradient(160deg, ${BLUSH_BG} 0%, #FFE4EC 100%)`,
+        fontFamily: "'Quicksand','Poppins',sans-serif",
+        borderRadius: 20,
+        border: `1px solid ${HEADER_PINK}`,
+        overflow: "hidden",
+        padding: 24,
+      }}
+    >
+      <style>{authStyles}</style>
+      <div className="auth-blob" style={{ width: 180, height: 180, background: "#FFC1CC", top: -50, left: -40 }} />
+      <div
+        className="auth-blob"
+        style={{ width: 220, height: 220, background: "#E8B4BE", bottom: -70, right: -60, animationDelay: "1.5s" }}
+      />
+      <div
+        className="auth-card"
+        style={{
+          position: "relative",
+          background: "rgba(255,255,255,0.9)",
+          backdropFilter: "blur(6px)",
+          padding: 34,
+          borderRadius: 20,
+          boxShadow: "0 14px 40px rgba(183,110,121,0.2)",
+          width: 320,
+          textAlign: "center",
+        }}
+      >
+        <div style={{ fontSize: 34, marginBottom: 10 }}>💌</div>
+        <div
+          style={{
+            fontFamily: "'Cormorant Garamond',serif",
+            fontStyle: "italic",
+            fontSize: 23,
+            color: ROSE_GOLD,
+            marginBottom: 10,
+          }}
+        >
+          our little chat is full for now
+        </div>
+        <p style={{ fontSize: 13, color: TEXT_SOFT, lineHeight: 1.6, marginBottom: 22 }}>
+          This is a small, closed circle and we've reached our limit of members. Nothing's
+          wrong — we just want to keep this space cozy for the people already here.
+        </p>
+        <a
+          href="mailto:yourgaljojo@gmail.com?subject=Pastel%20Chat%20-%20request%20to%20join"
+          className="auth-btn"
+          style={{
+            display: "inline-block",
+            padding: "12px 24px",
+            borderRadius: 999,
+            border: "none",
+            background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+            color: "#fff",
+            fontWeight: 700,
+            fontSize: 13,
+            textDecoration: "none",
+            letterSpacing: 0.3,
+          }}
+        >
+          Email the creator ✨
+        </a>
+      </div>
+    </div>
+  );
 }
 
 const authStyles = `
@@ -289,6 +420,7 @@ function AuthScreen({
 }
 
 function EmailStep({ email, setEmail, onSubmit, error }) {
+  const [agreed, setAgreed] = useState(false);
   return (
     <form onSubmit={onSubmit}>
       <input
@@ -316,19 +448,48 @@ function EmailStep({ email, setEmail, onSubmit, error }) {
       {error && (
         <p style={{ color: "#E24B7A", fontSize: 12, marginBottom: 12, textAlign: "left" }}>{error}</p>
       )}
+      <label
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: 8,
+          marginBottom: 16,
+          cursor: "pointer",
+          textAlign: "left",
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={agreed}
+          onChange={(e) => setAgreed(e.target.checked)}
+          style={{ marginTop: 2, accentColor: ROSE_GOLD, cursor: "pointer", flexShrink: 0 }}
+        />
+        <span style={{ fontSize: 11.5, color: TEXT_SOFT, lineHeight: 1.5 }}>
+          By signing in, you agree to our storage allocation rules and privacy terms.{" "}
+          <a
+            href="/terms.html"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: ROSE_GOLD, textDecoration: "underline" }}
+          >
+            Read our Full Terms &amp; Conditions.
+          </a>
+        </span>
+      </label>
       <button
         type="submit"
         className="auth-btn"
+        disabled={!agreed}
         style={{
           width: "100%",
           padding: "12px 0",
           borderRadius: 999,
           border: "none",
-          background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+          background: agreed ? `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)` : "#F0DCE2",
           color: "#fff",
           fontWeight: 700,
           fontSize: 14,
-          cursor: "pointer",
+          cursor: agreed ? "pointer" : "not-allowed",
           letterSpacing: 0.3,
         }}
       >
@@ -500,6 +661,9 @@ const chatStyles = `
   @keyframes pcFadeIn { from { opacity: 0; } to { opacity: 1; } }
   .pc-drawer { transition: transform .28s cubic-bezier(.32,.72,0,1); }
   .pc-room-btn { transition: background .15s ease; }
+  .pc-room-btn:hover { background: rgba(255,255,255,0.55) !important; }
+  .pc-invite-btn { transition: background .15s ease, color .15s ease; border-radius: 50%; }
+  .pc-invite-btn:hover { background: rgba(183,110,121,0.12) !important; color: ${ROSE_GOLD} !important; }
   .pc-modal-backdrop { animation: pcFadeIn .18s ease; }
 
   /* ---- Chromebook / desktop browser: dock the sidebar permanently ---- */
@@ -523,10 +687,11 @@ const chatStyles = `
   }
 `;
 
-function ChatApp({ session, profile, setProfile }) {
+function ChatApp({ session, profile, setProfile, inviteStatus }) {
   const [rooms, setRooms] = useState([]);
   const [activeRoomId, setActiveRoomId] = useState(null);
   const [newChatOpen, setNewChatOpen] = useState(false);
+  const [storageBytes, setStorageBytes] = useState(0);
 
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
@@ -553,6 +718,43 @@ function ChatApp({ session, profile, setProfile }) {
     setToast(t);
     setTimeout(() => setToast(""), 2200);
   };
+
+  // Show the "joined the chat via invite link" note once, on arrival.
+  useEffect(() => {
+    if (inviteStatus) showToast(inviteStatus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inviteStatus]);
+
+  // ---- Storage vault: project-wide 1GB Supabase free-tier ceiling ----
+  // total_bytes is a single running total kept accurate by DB triggers on
+  // storage.objects (increments on upload, decrements on delete), so this
+  // is one cheap read rather than listing every file to sum sizes.
+  const STORAGE_CAP_BYTES = 1024 * 1024 * 1024; // 1GB — Supabase free tier
+  const STORAGE_WARN_BYTES = 900 * 1024 * 1024; // 900MB — headroom buffer
+
+  useEffect(() => {
+    supabase
+      .from("storage_stats")
+      .select("total_bytes")
+      .single()
+      .then(({ data }) => data && setStorageBytes(data.total_bytes));
+
+    const channel = supabase
+      .channel("storage-stats-watch")
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "storage_stats" },
+        (payload) => setStorageBytes(payload.new.total_bytes)
+      )
+      .subscribe();
+    return () => supabase.removeChannel(channel);
+  }, []);
+
+  // Soft client-side gate — not a hard security boundary, just a friendly
+  // "you're out of room" before wasting an upload attempt. Uses the most
+  // recently known total, so it can be a little stale under heavy
+  // concurrent use, but that's fine for a warning, not a lock.
+  const wouldExceedStorageCap = (fileSize) => storageBytes + fileSize > STORAGE_CAP_BYTES;
 
   const activeRoom = rooms.find((r) => r.id === activeRoomId) || null;
 
@@ -913,6 +1115,11 @@ function ChatApp({ session, profile, setProfile }) {
       e.target.value = "";
       return;
     }
+    if (wouldExceedStorageCap(file.size)) {
+      showToast("Your media vault is full. Please delete old files to free up space.");
+      e.target.value = "";
+      return;
+    }
     const path = `${myId}/${Date.now()}-${file.name}`;
     const { error: upErr } = await supabase.storage.from("chat-media").upload(path, file, {
       contentType: file.type,
@@ -968,6 +1175,10 @@ function ChatApp({ session, profile, setProfile }) {
       recorder.onstop = async () => {
         const mime = recordingMimeRef.current;
         const blob = new Blob(audioChunks.current, { type: mime });
+        if (wouldExceedStorageCap(blob.size)) {
+          showToast("Your media vault is full. Please delete old files to free up space.");
+          return;
+        }
         const path = `${myId}/${Date.now()}-voice.${extensionFor(mime)}`;
         const { error: upErr } = await supabase.storage
           .from("chat-media")
@@ -986,6 +1197,11 @@ function ChatApp({ session, profile, setProfile }) {
   const handleAvatarUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (wouldExceedStorageCap(file.size)) {
+      showToast("Your media vault is full. Please delete old files to free up space.");
+      e.target.value = "";
+      return;
+    }
     const path = `${myId}/${Date.now()}-${file.name}`;
     const { error: upErr } = await supabase.storage.from("avatars").upload(path, file);
     if (upErr) return showToast("Avatar upload failed");
@@ -1045,6 +1261,21 @@ function ChatApp({ session, profile, setProfile }) {
     await loadRooms();
     setActiveRoomId(room.id);
     setNewChatOpen(false);
+  };
+
+  // Copies a shareable link to this specific room. The room's UUID *is*
+  // the invite token — unguessable, no separate token table needed. The
+  // RLS self-join policy already lets any signed-in user add themselves
+  // to a room_particiants row for a room_id they know, so this needs no
+  // extra backend work beyond what already exists.
+  const copyInviteLink = async (roomId) => {
+    const url = `${window.location.origin}${window.location.pathname}?room=${roomId}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast("Invite link copied 💌");
+    } catch {
+      showToast("Couldn't copy — long-press the link to copy manually");
+    }
   };
 
   // Group messages under day separators ("Today", "Yesterday", ...)
@@ -1189,6 +1420,40 @@ function ChatApp({ session, profile, setProfile }) {
           <Plus size={16} /> New chat
         </button>
 
+        {/* storage vault: project-wide usage against the Supabase free-tier 1GB cap */}
+        <div style={{ flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+            <HardDrive size={12} color={TEXT_SOFT} />
+            <span style={{ fontSize: 10.5, color: TEXT_SOFT, fontWeight: 600 }}>
+              Storage used: {(storageBytes / (1024 * 1024)).toFixed(0)}MB / 1GB
+            </span>
+          </div>
+          <div
+            style={{
+              height: 6,
+              borderRadius: 999,
+              background: "rgba(107,74,87,0.12)",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              className={storageBytes >= STORAGE_WARN_BYTES ? "pc-dot" : undefined}
+              style={{
+                height: "100%",
+                width: `${Math.min(100, (storageBytes / STORAGE_CAP_BYTES) * 100)}%`,
+                borderRadius: 999,
+                background:
+                  storageBytes >= STORAGE_CAP_BYTES
+                    ? "#E24B7A"
+                    : storageBytes >= STORAGE_WARN_BYTES
+                    ? "linear-gradient(90deg, #E8B4BE, #E24B7A)"
+                    : `linear-gradient(90deg, ${ROSE_GOLD}, #E8B4BE)`,
+                transition: "width .4s ease",
+              }}
+            />
+          </div>
+        </div>
+
         {/* scrollable room list */}
         <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
           {rooms.length === 0 ? (
@@ -1206,63 +1471,87 @@ function ChatApp({ session, profile, setProfile }) {
               const avatarUrl = room.isGroup ? undefined : room.otherParticipants[0]?.avatar_url;
               const active = room.id === activeRoomId;
               return (
-                <button
+                <div
                   key={room.id}
-                  className="pc-room-btn"
-                  onClick={() => {
-                    setActiveRoomId(room.id);
-                    setDrawerOpen(false);
-                  }}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 10,
-                    padding: "8px 8px",
-                    borderRadius: 14,
-                    border: "none",
-                    cursor: "pointer",
-                    textAlign: "left",
-                    width: "100%",
-                    background: active ? "rgba(255,255,255,0.75)" : "transparent",
-                  }}
+                  style={{ display: "flex", alignItems: "center", gap: 2 }}
                 >
-                  {room.isGroup ? (
-                    <div
-                      style={{
-                        width: 40,
-                        height: 40,
-                        borderRadius: "50%",
-                        flexShrink: 0,
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        background: "linear-gradient(135deg, #FFC1CC, #E8B4BE)",
-                        border: active ? `2px solid ${ROSE_GOLD}` : "none",
-                      }}
-                    >
-                      <Users size={17} color="#fff" />
-                    </div>
-                  ) : (
-                    <Avatar url={avatarUrl} name={avatarName} size={40} ring={active} />
-                  )}
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div
-                      style={{
-                        fontSize: 13.5,
-                        fontWeight: 700,
-                        color: TEXT_DEEP,
-                        whiteSpace: "nowrap",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                      }}
-                    >
-                      {title}
-                    </div>
-                    {room.isGroup && (
-                      <div style={{ fontSize: 11, color: TEXT_SOFT }}>{room.otherParticipants.length + 1} members</div>
+                  <button
+                    className="pc-room-btn"
+                    onClick={() => {
+                      setActiveRoomId(room.id);
+                      setDrawerOpen(false);
+                    }}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                      padding: "8px 8px",
+                      borderRadius: 14,
+                      border: "none",
+                      cursor: "pointer",
+                      textAlign: "left",
+                      flex: 1,
+                      minWidth: 0,
+                      background: active ? "rgba(255,255,255,0.75)" : "transparent",
+                    }}
+                  >
+                    {room.isGroup ? (
+                      <div
+                        style={{
+                          width: 40,
+                          height: 40,
+                          borderRadius: "50%",
+                          flexShrink: 0,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          background: "linear-gradient(135deg, #FFC1CC, #E8B4BE)",
+                          border: active ? `2px solid ${ROSE_GOLD}` : "none",
+                        }}
+                      >
+                        <Users size={17} color="#fff" />
+                      </div>
+                    ) : (
+                      <Avatar url={avatarUrl} name={avatarName} size={40} ring={active} />
                     )}
-                  </div>
-                </button>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div
+                        style={{
+                          fontSize: 13.5,
+                          fontWeight: 700,
+                          color: TEXT_DEEP,
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        {title}
+                      </div>
+                      {room.isGroup && (
+                        <div style={{ fontSize: 11, color: TEXT_SOFT }}>{room.otherParticipants.length + 1} members</div>
+                      )}
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => copyInviteLink(room.id)}
+                    aria-label="Copy invite link for this chat"
+                    title="Copy invite link"
+                    className="pc-invite-btn"
+                    style={{
+                      border: "none",
+                      background: "transparent",
+                      color: TEXT_SOFT,
+                      cursor: "pointer",
+                      padding: 8,
+                      flexShrink: 0,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    <Link2 size={15} />
+                  </button>
+                </div>
               );
             })
           )}
@@ -1695,14 +1984,37 @@ function NewChatModal({ myId, onClose, onCreate }) {
   const [creating, setCreating] = useState(false);
 
   useEffect(() => {
-    supabase
-      .from("profiles")
-      .select("id, nickname, avatar_url")
-      .neq("id", myId)
-      .then(({ data }) => {
-        setProfiles(data || []);
+    // Deliberately NOT "select all profiles" — that used to work only
+    // because the RLS policy silently truncated it to roommates, which is
+    // fragile and easy to misread as an open directory. This is the
+    // actual intended query: everyone I currently share at least one
+    // room with, explicitly, via room_participants.
+    (async () => {
+      const { data: myRoomRows, error: roomErr } = await supabase
+        .from("room_participants")
+        .select("room_id")
+        .eq("user_id", myId);
+      if (roomErr || !myRoomRows || myRoomRows.length === 0) {
+        setProfiles([]);
         setLoading(false);
+        return;
+      }
+      const roomIds = myRoomRows.map((r) => r.room_id);
+
+      const { data: coParticipantRows } = await supabase
+        .from("room_participants")
+        .select("profiles(id, nickname, avatar_url)")
+        .in("room_id", roomIds)
+        .neq("user_id", myId);
+
+      // dedupe — the same person can share more than one room with me
+      const seen = new Map();
+      (coParticipantRows || []).forEach((row) => {
+        if (row.profiles) seen.set(row.profiles.id, row.profiles);
       });
+      setProfiles([...seen.values()]);
+      setLoading(false);
+    })();
   }, [myId]);
 
   const toggle = (id) => {
@@ -1780,8 +2092,10 @@ function NewChatModal({ myId, onClose, onCreate }) {
           {loading ? (
             <div style={{ fontSize: 13, color: TEXT_SOFT, textAlign: "center", padding: 20 }}>Loading friends…</div>
           ) : profiles.length === 0 ? (
-            <div style={{ fontSize: 13, color: TEXT_SOFT, textAlign: "center", padding: 20 }}>
-              No other profiles yet
+            <div style={{ fontSize: 13, color: TEXT_SOFT, textAlign: "center", padding: "24px 12px", lineHeight: 1.6 }}>
+              You'll see people here once you're both in a chat together.
+              <br />
+              Use the link icon next to a chat to invite someone new 💌
             </div>
           ) : (
             profiles.map((p) => {
