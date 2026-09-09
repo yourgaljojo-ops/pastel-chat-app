@@ -97,6 +97,7 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [sessionChecked, setSessionChecked] = useState(false);
   const [profile, setProfile] = useState(null);
+  const [profileError, setProfileError] = useState(null); // null | "missing" | "error"
   const [authEmail, setAuthEmail] = useState("");
   const [authStep, setAuthStep] = useState("email"); // "email" | "code"
   const [authError, setAuthError] = useState("");
@@ -127,7 +128,17 @@ export default function App() {
       .select("*")
       .eq("id", session.user.id)
       .single()
-      .then(({ data }) => data && setProfile(data));
+      .then(({ data, error }) => {
+        if (data) {
+          setProfile(data);
+          return;
+        }
+        // PGRST116 = .single() found zero rows — a real "this account has
+        // no profile" case (e.g. it was deleted), not a network hiccup.
+        // Anything else is a genuine fetch failure. Either way, surface it
+        // instead of leaving "Loading your profile…" spinning forever.
+        setProfileError(error?.code === "PGRST116" ? "missing" : "error");
+      });
   }, [session]);
 
   // Invite-link on-ramp: if someone arrives via a shared room link
@@ -236,7 +247,17 @@ export default function App() {
     );
   }
 
-  if (!profile) return <CenteredNote text="Loading your profile…" />;
+  if (!profile) {
+    if (profileError) {
+      return (
+        <ProfileMissingScreen
+          reason={profileError}
+          onSignOut={() => supabase.auth.signOut()}
+        />
+      );
+    }
+    return <CenteredNote text="Loading your profile…" />;
+  }
 
   return <ChatApp session={session} profile={profile} setProfile={setProfile} inviteStatus={inviteStatus} />;
 }
@@ -313,6 +334,87 @@ function CapacityFullScreen() {
         >
           Email the creator ✨
         </a>
+      </div>
+    </div>
+  );
+}
+
+// Shown when someone is authenticated (a valid session exists) but no
+// matching profiles row can be found — e.g. the account was removed, or
+// something genuinely went wrong fetching it. Either way, this is the
+// deliberate "here's what happened, here's your way out" state, instead
+// of hanging on "Loading your profile…" forever with no explanation.
+function ProfileMissingScreen({ reason, onSignOut }) {
+  const isMissing = reason === "missing";
+  return (
+    <div
+      style={{
+        minHeight: 520,
+        position: "relative",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: `linear-gradient(160deg, ${BLUSH_BG} 0%, #FFE4EC 100%)`,
+        fontFamily: "'Quicksand','Poppins',sans-serif",
+        borderRadius: 20,
+        border: `1px solid ${HEADER_PINK}`,
+        overflow: "hidden",
+        padding: 24,
+      }}
+    >
+      <style>{authStyles}</style>
+      <div className="auth-blob" style={{ width: 180, height: 180, background: "#FFC1CC", top: -50, left: -40 }} />
+      <div
+        className="auth-blob"
+        style={{ width: 220, height: 220, background: "#E8B4BE", bottom: -70, right: -60, animationDelay: "1.5s" }}
+      />
+      <div
+        className="auth-card"
+        style={{
+          position: "relative",
+          background: "rgba(255,255,255,0.9)",
+          backdropFilter: "blur(6px)",
+          padding: 34,
+          borderRadius: 20,
+          boxShadow: "0 14px 40px rgba(183,110,121,0.2)",
+          width: 320,
+          textAlign: "center",
+        }}
+      >
+        <div style={{ fontSize: 34, marginBottom: 10 }}>{isMissing ? "🌙" : "💗"}</div>
+        <div
+          style={{
+            fontFamily: "'Cormorant Garamond',serif",
+            fontStyle: "italic",
+            fontSize: 21,
+            color: ROSE_GOLD,
+            marginBottom: 10,
+          }}
+        >
+          {isMissing ? "this account no longer exists" : "something went wrong"}
+        </div>
+        <p style={{ fontSize: 13, color: TEXT_SOFT, lineHeight: 1.6, marginBottom: 22 }}>
+          {isMissing
+            ? "This login was removed. If that's unexpected, reach out to the creator — otherwise you can sign in with a different email."
+            : "We couldn't load your profile just now. Signing out and back in usually fixes this."}
+        </p>
+        <button
+          onClick={onSignOut}
+          className="auth-btn"
+          style={{
+            padding: "12px 24px",
+            borderRadius: 999,
+            border: "none",
+            background: `linear-gradient(135deg, ${ROSE_GOLD}, #E8B4BE)`,
+            color: "#fff",
+            fontWeight: 700,
+            fontSize: 13,
+            letterSpacing: 0.3,
+            cursor: "pointer",
+          }}
+        >
+          Sign out
+        </button>
       </div>
     </div>
   );
